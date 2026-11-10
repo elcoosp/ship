@@ -1,13 +1,13 @@
 <div align="center">
-   <img src="https://cdn.jsdelivr.net/gh/OWNER/REPO@main/docs/logo.png" alt="ship Logo" width="300"/>
+   <img src="https://cdn.jsdelivr.net/gh/elcoosp/ship@main/docs/logo.png" alt="ship Logo" width="300"/>
    <p>
      <strong>A git-only delivery pipeline that merges AI patches into pull requests in under 30 seconds.</strong><br/>
      <code>ship</code> automates the commit, push, and release ceremony. Drop a zip file from your AI coding agent, and it handles 3-way merges, conventional commits, and PR creation with zero CI waits. Built for Rust and Node monorepos that demand resilient git safety and parallel execution.
    </p>
    <p>
-     <a href="https://github.com/OWNER/REPO/actions"><img src="https://img.shields.io/github/actions/workflow/status/OWNER/REPO/ci.yml?style=flat-square&label=build" alt="Build status"/></a>
+     <a href="https://github.com/elcoosp/ship/actions"><img src="https://img.shields.io/github/actions/workflow/status/elcoosp/ship/ci.yml?style=flat-square&label=build" alt="Build status"/></a>
      <a href="https://crates.io/crates/ship"><img src="https://img.shields.io/crates/v/ship?style=flat-square" alt="crates.io"/></a>
-     <a href="LICENSE"><img src="https://img.shields.io/github/license/OWNER/REPO?style=flat-square" alt="License"/></a>
+     <a href="LICENSE"><img src="https://img.shields.io/github/license/elcoosp/ship?style=flat-square" alt="License"/></a>
      <img src="https://img.shields.io/badge/Rust-1.75%2B-orange?style=flat-square&logo=rust" alt="Rust 1.75+"/>
    </p>
    <p>
