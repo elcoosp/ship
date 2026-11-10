@@ -1,9 +1,11 @@
+use anyhow::Result;
 use clap::{Parser, Subcommand};
 use ship::manifest;
-use ship::pipeline::{self, Outcome};
+use ship::pipeline;
 use ship::shell::RealShell;
 use ship::watch::{self, WatchConfig};
 use std::path::PathBuf;
+use std::time::Duration;
 
 #[derive(Parser)]
 #[command(version, about = "git-only milestone delivery pipeline")]
@@ -17,6 +19,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Commit, bump version, push, open PR, admin-merge, sync default.
     Prepare {
         #[arg(long)]
         dry_run: bool,
@@ -26,20 +29,7 @@ enum Cmd {
         #[arg(long)]
         clean_locks: bool,
     },
-    Tag {
-        #[arg(long)]
-        dry_run: bool,
-        #[arg(long)]
-        clean_locks: bool,
-    },
-    All {
-        #[arg(long)]
-        dry_run: bool,
-        #[arg(long)]
-        reset: bool,
-        #[arg(long)]
-        clean_locks: bool,
-    },
+    /// Watch a directory for {project}-{slug}.zip and ship each one.
     Watch {
         #[arg(long)]
         watch_dir: Option<PathBuf>,
@@ -53,23 +43,22 @@ enum Cmd {
         allow_repo_manifest: bool,
         #[arg(long)]
         clean_locks: bool,
+        /// Force polling mode; skip notify/FSEvents entirely.
+        #[arg(long)]
+        poll: bool,
+        /// Poll interval in milliseconds (default 2000).
+        #[arg(long, default_value_t = 2000)]
+        poll_interval_ms: u64,
     },
+    /// List detected projects under repos_root.
     Projects {
         #[arg(long)]
         repos_root: Option<PathBuf>,
     },
 }
 
-fn main() -> anyhow::Result<()> {
+fn main() -> Result<()> {
     let cli = Cli::parse();
-
-    // Init the log sink for every subcommand. Watch overrides with its own
-    // --log-file when present (OnceLock::set is idempotent — first wins, so
-    // watch's init happens inside watch::run BEFORE any other path).
-    let default_log = std::env::var("HOME")
-        .ok()
-        .map(|h| PathBuf::from(h).join(".local/state/ship/watcher.log"));
-    ship::ui::init_log(default_log);
 
     if let Cmd::Watch {
         watch_dir,
@@ -78,6 +67,8 @@ fn main() -> anyhow::Result<()> {
         once,
         allow_repo_manifest,
         clean_locks,
+        poll,
+        poll_interval_ms,
     } = &cli.cmd
     {
         let mut cfg = WatchConfig::default();
@@ -92,6 +83,8 @@ fn main() -> anyhow::Result<()> {
         }
         cfg.allow_repo_manifest = *allow_repo_manifest;
         cfg.clean_locks = *clean_locks;
+        cfg.poll_only = *poll;
+        cfg.poll_interval = Duration::from_millis(*poll_interval_ms);
         return watch::run(cfg, *once);
     }
 
@@ -111,48 +104,17 @@ fn main() -> anyhow::Result<()> {
             reset,
             clean_locks,
         } => pipeline::prepare(dry_run, reset, clean_locks, &manifest, &shell)?,
-        Cmd::Tag {
-            dry_run,
-            clean_locks,
-        } => pipeline::tag(dry_run, clean_locks, &manifest, &shell)?,
-        Cmd::All {
-            dry_run,
-            reset,
-            clean_locks,
-        } => {
-            let p = pipeline::prepare(dry_run, reset, clean_locks, &manifest, &shell)?;
-            if dry_run {
-                p
-            } else {
-                let t = pipeline::tag(false, clean_locks, &manifest, &shell)?;
-                Outcome {
-                    pr_url: p.pr_url.or(t.pr_url),
-                    merged: p.merged.or(t.merged),
-                    tag: t.tag,
-                }
-            }
-        }
         Cmd::Watch { .. } | Cmd::Projects { .. } => unreachable!(),
     };
 
-    if cli.cmd_is_prepare_like() {
-        ship::ui::final_success(
-            outcome.pr_url.as_deref(),
-            outcome.merged.as_deref(),
-            outcome.tag.as_deref(),
-        );
-    } else {
-        // tag command: no PR panel, just the tag
-        if let Some(t) = outcome.tag.as_deref() {
-            ship::ui::tagged(t, true);
-        }
+    if let Some(u) = outcome.pr_url.as_deref() {
+        ship::ui::machine("PR_URL", u);
     }
-    Ok(())
-}
+    if let Some(s) = outcome.merged.as_deref() {
+        ship::ui::machine("MERGED", s);
+    }
 
-// Helper so main() can branch on the command without re-matching.
-impl Cli {
-    fn cmd_is_prepare_like(&self) -> bool {
-        matches!(self.cmd, Cmd::Prepare { .. } | Cmd::All { .. })
-    }
+    ship::ui::final_success(outcome.pr_url.as_deref(), outcome.merged.as_deref());
+
+    Ok(())
 }
