@@ -115,35 +115,6 @@ pub fn local_default_not_ahead(shell: &dyn Shell, remote: &str, default: &str) -
     Ok(())
 }
 
-pub fn tag_absent(shell: &dyn Shell, remote: &str, tag: &str) -> Result<()> {
-    if run_ok(
-        shell,
-        &[
-            "git",
-            "rev-parse",
-            "-q",
-            "--verify",
-            &format!("refs/tags/{tag}"),
-        ],
-    )? {
-        bail!("tag {tag} already exists locally — refusing to re-tag");
-    }
-    let out = run_checked(
-        shell,
-        &[
-            "git",
-            "ls-remote",
-            "--refs",
-            remote,
-            &format!("refs/tags/{tag}"),
-        ],
-    )?;
-    if !out.stdout.trim().is_empty() {
-        bail!("tag {tag} already exists on {remote} — release already shipped");
-    }
-    Ok(())
-}
-
 pub fn no_git_operation_in_progress(shell: &dyn Shell) -> Result<()> {
     let check = |name: &str| -> Result<bool> {
         let out = run_checked(shell, &["git", "rev-parse", "--git-path", name])?;
