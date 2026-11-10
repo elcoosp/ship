@@ -73,9 +73,6 @@ impl Manifest {
         if !prefixes.contains(&prefix) {
             bail!("branch prefix '{}' not in {:?}", prefix, prefixes);
         }
-        if self.commit.is_empty() {
-            bail!("manifest has no [[commit]] groups");
-        }
         let re = Regex::new(
             r"^(feat|fix|docs|refactor|perf|chore|build|test|ci|style|revert)(\([^)]+\))?!?: .+$",
         )?;
