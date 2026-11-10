@@ -307,18 +307,23 @@ pub fn section_ok(project: &str, tag: &str, pr_url: Option<&str>, elapsed: Durat
         .width(74)
         .padding(2);
 
-    p = p.line(Line::new().push("📂 Project ").dim().push(project).white());
+    // Hardcoded spacing bypasses terminal-specific emoji width bugs.
+    // We also completely removed .link() and .underline() since your terminal
+    // does not support OSC 8 hyperlinks.
+    p = p.line(Line::new().push("📂 Project  ").dim().push(project).white());
     if let Some(url) = pr_url {
         p = p.line(
             Line::new()
-                .push("🔗 PR      ")
+                .push("🔗 PR       ")
                 .dim()
-                .push(Span::new(url).fg(C_PRIMARY).underline().link(url)),
+                .push(url)
+                .fg(C_PRIMARY)
+                .bold(),
         );
     }
     p = p.line(
         Line::new()
-            .push("⚑ Tag     ")
+            .push("⚑ Tag       ")
             .dim()
             .push(tag)
             .fg(C_PRIMARY)
@@ -326,7 +331,7 @@ pub fn section_ok(project: &str, tag: &str, pr_url: Option<&str>, elapsed: Durat
     );
     p = p.line(
         Line::new()
-            .push("⏱ Time    ")
+            .push("⏱ Time      ")
             .dim()
             .push(time.as_str())
             .white(),
