@@ -357,19 +357,14 @@ fn process_zip(
         let started = std::time::Instant::now();
         match process_zip_inner(&repo_clone, &zip, &name_clone, wrapper.as_deref()) {
             Ok(outcome) => {
-                let tag = outcome.tag.as_deref().unwrap_or("?");
-                ui::section_ok(
-                    &project_clone,
-                    tag,
-                    outcome.pr_url.as_deref(),
-                    started.elapsed(),
-                );
+                let pr_url = outcome.pr_url.as_deref();
+                ui::section_ok(&project_clone, pr_url, started.elapsed());
                 move_to(&cfg_processed, &zip, &name_clone);
 
                 let title = format!("ship succeeded: {}", project_clone);
-                let body = match &outcome.pr_url {
-                    Some(url) => format!("Tag: {}\n{}", tag, url),
-                    None => format!("Tag: {}", tag),
+                let body = match pr_url {
+                    Some(url) => format!("Merged: {}", url),
+                    None => "Merged".to_string(),
                 };
                 notify(&title, &body, outcome.pr_url.as_deref(), false);
 
@@ -622,14 +617,8 @@ fn process_zip_inner(
             ));
         }
 
-        // 4. Prepare & Tag
-        let prep = pipeline::prepare(false, false, false, &manifest, &shell)?;
-        let t = pipeline::tag(false, false, &manifest, &shell)?;
-        let outcome = crate::pipeline::Outcome {
-            pr_url: prep.pr_url.or(t.pr_url),
-            merged: prep.merged.or(t.merged),
-            tag: t.tag,
-        };
+        // 4. Prepare
+        let outcome = pipeline::prepare(false, false, false, &manifest, &shell)?;
 
         if stashed {
             if run_checked(&shell, &["git", "stash", "pop"]).is_ok() {
