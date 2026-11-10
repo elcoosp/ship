@@ -10,7 +10,6 @@ use std::time::Duration;
 pub struct Outcome {
     pub pr_url: Option<String>,
     pub merged: Option<String>,
-    pub tag: Option<String>,
 }
 
 pub fn prepare(
@@ -66,12 +65,7 @@ pub fn prepare(
 
     crate::ui::step("fetching origin...");
     run_checked(shell, &["git", "fetch", remote, "--prune"])?;
-    let (old, new, first_release) = resolve_versions(shell, remote, &default, m_orig)?;
-    let tag = format!("v{new}");
-    guards::tag_absent(shell, remote, &tag)?;
-    if !first_release {
-        version::assert_forward(old, new)?;
-    }
+    let (new, first_release) = resolve_target_version(shell, remote, &default, m_orig)?;
 
     let dirty_now = if guards::is_dirty(shell)? {
         guards::dirty_paths(shell)?
@@ -104,7 +98,6 @@ pub fn prepare(
         guards::union_check(&dirty_now, &manifest_paths)?;
     }
 
-    let changelog_present = std::path::Path::new("CHANGELOG.md").exists();
     let version_matches = version::read_workspace_version(&PathBuf::from("Cargo.toml"))
         .map(|v| v == new)
         .unwrap_or(false);
@@ -118,19 +111,13 @@ pub fn prepare(
             if version_matches {
                 println!("# would skip: ensure_version (already at {new})");
             } else {
-                println!("# would run:  ensure_version ({old} → {new})");
-            }
-            if changelog_present {
-                println!("# would update: CHANGELOG.md (--prepend {tag}, commit --amend)");
-            } else {
-                println!("# would create: CHANGELOG.md (then commit --amend)");
+                println!("# would run:  ensure_version (→ {new})");
             }
             println!("# would push: {remote}/{}", m.delivery.branch);
             println!("# would open PR: {:?}", m.delivery.pr_title);
             println!("# would merge: --admin --rebase --delete-branch");
-            println!("# would tag: {tag} at the merge SHA");
         } else {
-            print_plan(m, &default, old, new, &tag, first_release);
+            print_plan(m, &default, new, first_release);
         }
         return Ok(Outcome::default());
     }
@@ -148,13 +135,10 @@ pub fn prepare(
     let current = version::read_workspace_version(&shell.cwd().join("Cargo.toml"))?;
     if current == new {
         crate::ui::version_skipped(&new.to_string(), "already at target");
-    } else if current == old {
-        ensure_version(shell, &old, &new)?;
     } else {
-        bail!("Cargo.toml version is {current}, expected {old} or {new} — manual recovery needed");
+        ensure_version(shell, &current, &new)?;
     }
 
-    ensure_changelog(shell, &tag)?;
     ensure_pushed(shell, &m.delivery.branch)?;
     let pr_url = ensure_pr(shell, m, &default)?;
     let merged = merge_immediately(shell, &pr_url)?;
@@ -166,29 +150,24 @@ pub fn prepare(
     Ok(Outcome {
         pr_url: Some(pr_url),
         merged: Some(merged),
-        tag: None,
     })
 }
 
-fn resolve_versions(
+fn resolve_target_version(
     shell: &dyn Shell,
     remote: &str,
     default: &str,
     m: &Manifest,
-) -> Result<(version::Version, version::Version, bool)> {
-    if let Some(old) = version::last_release_tag(shell)? {
-        let new = old.bump(resolve_bump_level(m)?);
-        return Ok((old, new, false));
-    }
+) -> Result<(version::Version, bool)> {
+    let level = resolve_bump_level(m)?;
     if let Some(old) =
         version::read_workspace_version_at_opt(shell, &format!("{remote}/{default}"), "Cargo.toml")?
     {
-        let new = old.bump(resolve_bump_level(m)?);
-        return Ok((old, new, false));
+        return Ok((old.bump(level), false));
     }
-    let new = version::read_workspace_version(&PathBuf::from("Cargo.toml"))
-        .context("first release: no tag, no origin manifest, and no local Cargo.toml")?;
-    Ok((new, new, true))
+    let new = version::read_workspace_version(&shell.cwd().join("Cargo.toml"))
+        .context("cannot find origin manifest or local Cargo.toml")?;
+    Ok((new, true))
 }
 
 fn report_drops(original: &Manifest, expanded: &Manifest, drops: &crate::manifest::DropReport) {
@@ -219,29 +198,20 @@ fn report_drops(original: &Manifest, expanded: &Manifest, drops: &crate::manifes
     }
 }
 
-fn print_plan(
-    m: &Manifest,
-    default: &str,
-    old: version::Version,
-    new: version::Version,
-    tag: &str,
-    first_release: bool,
-) {
+fn print_plan(m: &Manifest, default: &str, new: version::Version, first_release: bool) {
     let _ = default;
-    crate::ui::plan_header(
-        &m.delivery.branch,
-        &old.to_string(),
-        &new.to_string(),
-        tag,
-        first_release,
-    );
-    let non_empty = m.commit.iter().filter(|g| !g.files.is_empty()).count();
-    for (i, g) in m.commit.iter().enumerate() {
-        if g.files.is_empty() {
-            continue;
+    crate::ui::plan_header(&m.delivery.branch, &new.to_string(), first_release);
+    if m.commit.is_empty() {
+        crate::ui::plan_commit(0, 1, "auto per-file commits (chore: update <file>)");
+    } else {
+        let non_empty = m.commit.iter().filter(|g| !g.files.is_empty()).count();
+        for (i, g) in m.commit.iter().enumerate() {
+            if g.files.is_empty() {
+                continue;
+            }
+            let label = format!("{}  ({} files)", g.message, g.files.len());
+            crate::ui::plan_commit(i, non_empty, &label);
         }
-        let label = format!("{}  ({} files)", g.message, g.files.len());
-        crate::ui::plan_commit(i, non_empty, &label);
     }
     crate::ui::plan_footer();
 }
@@ -285,105 +255,6 @@ fn resolve_bump_level(m: &Manifest) -> Result<version::BumpLevel> {
         );
     }
     Ok(declared)
-}
-
-pub fn tag(dry_run: bool, clean_locks: bool, m: &Manifest, shell: &dyn Shell) -> Result<Outcome> {
-    let remote = &m.delivery.remote;
-    let branch = &m.delivery.branch;
-    let default = guards::default_branch(shell, remote)?;
-    guards::gh_authenticated(shell)?;
-    guards::ensure_no_git_locks(shell, clean_locks)?;
-
-    let info = lookup_merged(shell, branch)?
-        .ok_or_else(|| anyhow!("no merged PR for {branch} — run `ship prepare` first"))?;
-
-    if dry_run {
-        let version = match version::read_workspace_version_at_opt(
-            shell,
-            &format!("{remote}/{default}"),
-            "Cargo.toml",
-        )? {
-            Some(v) => v,
-            None => version::read_workspace_version(&shell.cwd().join("Cargo.toml"))?,
-        };
-        let tag = format!("v{version}");
-        println!("would tag {tag} at {} (PR {})", info.sha, info.url);
-        return Ok(Outcome::default());
-    }
-
-    run_checked(shell, &["git", "fetch", remote, "--prune"])?;
-    guards::local_default_not_ahead(shell, remote, &default)?;
-
-    let current = run_checked(shell, &["git", "rev-parse", "--abbrev-ref", "HEAD"])?
-        .stdout
-        .trim()
-        .to_string();
-    let head = run_checked(shell, &["git", "rev-parse", "HEAD"])?
-        .stdout
-        .trim()
-        .to_string();
-    if current != default || head != info.sha {
-        ensure_synced(shell, &default, remote, &info.sha)?;
-    }
-    guards::verify_author(shell)?;
-
-    let version = version::read_workspace_version(&shell.cwd().join("Cargo.toml"))?;
-    let tag = format!("v{version}");
-    guards::tag_absent(shell, remote, &tag)?;
-    run_checked(
-        shell,
-        &[
-            "git",
-            "tag",
-            "-a",
-            &tag,
-            &info.sha,
-            "-m",
-            &format!("release {tag}"),
-        ],
-    )?;
-    run_checked(shell, &["git", "push", remote, &format!("refs/tags/{tag}")])?;
-    verify_tag(shell, remote, &tag)?;
-    crate::ui::tagged(&tag, true);
-
-    Ok(Outcome {
-        pr_url: Some(info.url),
-        merged: Some(info.sha),
-        tag: Some(tag),
-    })
-}
-
-struct MergeInfo {
-    url: String,
-    sha: String,
-}
-
-fn lookup_merged(shell: &dyn Shell, branch: &str) -> Result<Option<MergeInfo>> {
-    let out = run_checked(
-        shell,
-        &[
-            "gh",
-            "pr",
-            "list",
-            "--head",
-            branch,
-            "--state",
-            "merged",
-            "--json",
-            "url,mergeCommit",
-            "--jq",
-            r#".[0] | select(. != null) | "\(.url) \(.mergeCommit.oid)""#,
-        ],
-    )?
-    .stdout;
-    let line = out.trim();
-    if line.is_empty() {
-        return Ok(None);
-    }
-    let mut it = line.splitn(2, ' ');
-    let url = it.next().context("url")?.to_string();
-    let sha = it.next().context("sha")?.to_string();
-    Ok(Some(MergeInfo { url, sha }))
 }
 
 fn merge_immediately(shell: &dyn Shell, pr_url: &str) -> Result<String> {
@@ -518,6 +389,25 @@ fn ensure_on_branch(shell: &dyn Shell, m: &Manifest, remote: &str, default: &str
 
 fn ensure_committed(shell: &dyn Shell, m: &Manifest, remote: &str, default: &str) -> Result<()> {
     let base = format!("{remote}/{default}");
+
+    if m.commit.is_empty() {
+        // Auto per-file mode
+        let dirty = guards::dirty_paths(shell)?;
+        let total = dirty.len();
+        for (idx, path) in dirty.into_iter().enumerate() {
+            let path_str = path.to_string_lossy();
+            let msg = format!("chore: update {}", path_str);
+            run_checked(shell, &["git", "add", "--", &path_str])?;
+            let status_out = shell.run(&["git", "status", "--porcelain"])?;
+            if status_out.stdout.trim().is_empty() {
+                continue;
+            }
+            run_checked(shell, &["git", "commit", "--no-verify", "-m", &msg])?;
+            crate::ui::commit_step(idx + 1, total, &msg);
+        }
+        return Ok(());
+    }
+
     let total = m.commit.len();
     for (idx, g) in m.commit.iter().enumerate() {
         if g.files.is_empty() {
@@ -619,51 +509,6 @@ fn ensure_version(shell: &dyn Shell, old: &version::Version, new: &version::Vers
             shell,
             &["git", "commit", "-m", &format!("chore(release): v{new}")],
         )?;
-    }
-    Ok(())
-}
-
-fn ensure_changelog(shell: &dyn Shell, tag: &str) -> Result<()> {
-    guards::require_command(
-        shell,
-        &["git-cliff", "--version"],
-        "cargo install git-cliff",
-    )?;
-    let path = shell.cwd().join("CHANGELOG.md");
-    let path = path.as_path();
-    if path.exists() {
-        let content = std::fs::read_to_string(path)?;
-        if content.contains(&format!("## [{tag}]")) {
-            crate::ui::changelog_status("already present", tag);
-            return Ok(());
-        }
-    } else {
-        std::fs::write(
-            path,
-            "# Changelog\n\n\
-             All notable changes to this project are documented in this file.\n\
-             The format is based on [Keep a Changelog](https://keepachangelog.com/)\n\
-             and this project adheres to [Semantic Versioning](https://semver.org/).\n",
-        )?;
-        crate::ui::changelog_status("created", tag);
-    }
-    run_checked(
-        shell,
-        &[
-            "git-cliff",
-            "--unreleased",
-            "--tag",
-            tag,
-            "--prepend",
-            "CHANGELOG.md",
-        ],
-    )?;
-    run_checked(shell, &["git", "add", "--", "CHANGELOG.md"])?;
-    if !guards::staged_is_empty(shell)? {
-        run_checked(shell, &["git", "commit", "--amend", "--no-edit"])?;
-        crate::ui::changelog_status("folded", tag);
-    } else {
-        crate::ui::changelog_status("unchanged", tag);
     }
     Ok(())
 }
@@ -779,26 +624,6 @@ fn ensure_synced(shell: &dyn Shell, default: &str, remote: &str, merged: &str) -
         .to_string();
     if head != merged {
         bail!("after sync, HEAD is {head} but the merged SHA was {merged} — origin moved mid-run");
-    }
-    Ok(())
-}
-
-fn verify_tag(shell: &dyn Shell, remote: &str, tag: &str) -> Result<()> {
-    let present = !run_checked(
-        shell,
-        &[
-            "git",
-            "ls-remote",
-            "--refs",
-            remote,
-            &format!("refs/tags/{tag}"),
-        ],
-    )?
-    .stdout
-    .trim()
-    .is_empty();
-    if !present {
-        bail!("tag {tag} is not on {remote} after push");
     }
     Ok(())
 }
