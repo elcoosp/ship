@@ -119,26 +119,6 @@ pub fn read_workspace_version_at_opt(
     }
 }
 
-/// Last `v*` tag reachable from HEAD, parsed as a Version.
-pub fn last_release_tag(shell: &dyn Shell) -> Result<Option<Version>> {
-    let out = shell.run(&[
-        "git",
-        "describe",
-        "--tags",
-        "--abbrev=0",
-        "--match",
-        "v[0-9]*",
-    ])?;
-    if out.status != 0 {
-        return Ok(None);
-    }
-    let tag = out.stdout.trim();
-    if tag.is_empty() {
-        return Ok(None);
-    }
-    Ok(Some(Version::parse(tag.trim_start_matches('v'))?))
-}
-
 pub fn assert_forward(old: Version, new: Version) -> Result<()> {
     if new <= old {
         bail!("new version {} is not > old version {}", new, old);
