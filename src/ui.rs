@@ -122,9 +122,6 @@ pub fn banner_startup() {
     if !std::io::stdout().is_terminal() {
         return;
     }
-    // Forcefully reset the terminal state in case a previous TUI crash left it broken.
-    let _ = crossterm::terminal::disable_raw_mode();
-    let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen);
     mp().suspend(|| {
         const LOGO: &[&str] = &[
             "  ███████╗ ██╗  ██╗ ██╗ ██████╗ ",
@@ -296,7 +293,7 @@ pub fn section_begin(zip_name: &str, detail: Option<&str>) {
     append_log(&format!("BEGIN {zip_name}"));
 }
 
-pub fn section_ok(project: &str, tag: &str, pr_url: Option<&str>, elapsed: Duration) {
+pub fn section_ok(project: &str, pr_url: Option<&str>, elapsed: Duration) {
     clear_task();
     let time = human_duration(elapsed);
     flush_buffer();
@@ -307,9 +304,6 @@ pub fn section_ok(project: &str, tag: &str, pr_url: Option<&str>, elapsed: Durat
         .width(74)
         .padding(2);
 
-    // Hardcoded spacing bypasses terminal-specific emoji width bugs.
-    // We also completely removed .link() and .underline() since your terminal
-    // does not support OSC 8 hyperlinks.
     p = p.line(Line::new().push("📂 Project  ").dim().push(project).white());
     if let Some(url) = pr_url {
         p = p.line(
@@ -323,14 +317,6 @@ pub fn section_ok(project: &str, tag: &str, pr_url: Option<&str>, elapsed: Durat
     }
     p = p.line(
         Line::new()
-            .push("⚑ Tag       ")
-            .dim()
-            .push(tag)
-            .fg(C_PRIMARY)
-            .bold(),
-    );
-    p = p.line(
-        Line::new()
             .push("⏱ Time      ")
             .dim()
             .push(time.as_str())
@@ -341,7 +327,7 @@ pub fn section_ok(project: &str, tag: &str, pr_url: Option<&str>, elapsed: Durat
         println!();
         p.println();
     });
-    append_log(&format!("[OK] {project} tagged {tag} ({})", time));
+    append_log(&format!("[OK] {project} merged ({})", time));
 }
 
 pub fn commit_step(idx: usize, total: usize, subject: &str) {
@@ -434,25 +420,6 @@ pub fn version_skipped(at: &str, reason: &str) {
     print_line(&line);
 }
 
-pub fn changelog_status(kind: &str, tag: &str) {
-    let line = Line::new()
-        .push(padded_prefix())
-        .fg(C_DIM)
-        .push("✓ ")
-        .fg(C_SUCCESS)
-        .dim()
-        .push(pad("changelog", 10, Align::Left, ' '))
-        .dim()
-        .push(kind)
-        .white()
-        .push(" ")
-        .dim()
-        .push(tag)
-        .fg(C_PRIMARY)
-        .bold();
-    print_line(&line);
-}
-
 pub fn pr_opened(url: &str) {
     let line = Line::new()
         .push(padded_prefix())
@@ -502,27 +469,6 @@ pub fn merged(sha: &str) {
         .dim();
     print_line(&line);
     machine("MERGED", sha);
-}
-
-pub fn tagged(tag: &str, verified: bool) {
-    let mut line = Line::new()
-        .push(padded_prefix())
-        .fg(C_DIM)
-        .push("✓ ")
-        .fg(C_SUCCESS)
-        .dim()
-        .push(pad("tagged", 10, Align::Left, ' '))
-        .dim()
-        .push("⚑ ")
-        .fg(C_WARN)
-        .push(tag)
-        .fg(C_PRIMARY)
-        .bold();
-    if verified {
-        line = line.push(" (verified)").dim();
-    }
-    print_line(&line);
-    machine("TAG", tag);
 }
 
 pub fn warn(msg: &str) {
@@ -622,9 +568,12 @@ pub fn error_panel(headline: &str, detail: &str, recovery: &[String]) {
     }
 }
 
-pub fn plan_header(branch: &str, from: &str, to: &str, tag: &str, first_release: bool) {
+pub fn plan_header(branch: &str, new: &str, first_release: bool) {
     mp().suspend(|| {
-        println!("\n  ──────────────────────────────────────────────────────────────────");
+        println!(
+            "
+  ──────────────────────────────────────────────────────────────────"
+        );
         Line::new()
             .push("  📦 ")
             .push("ship plan")
@@ -648,7 +597,7 @@ pub fn plan_header(branch: &str, from: &str, to: &str, tag: &str, first_release:
                 .push(pad("release", width, Align::Left, ' '))
                 .dim()
                 .push("  ")
-                .push(format!("first release · tag {tag}"))
+                .push("first release")
                 .println();
         } else {
             Line::new()
@@ -656,14 +605,7 @@ pub fn plan_header(branch: &str, from: &str, to: &str, tag: &str, first_release:
                 .push(pad("version", width, Align::Left, ' '))
                 .dim()
                 .push("  ")
-                .push(format!("{from} → {to}"))
-                .println();
-            Line::new()
-                .push("  ")
-                .push(pad("tag", width, Align::Left, ' '))
-                .dim()
-                .push("  ")
-                .push(tag)
+                .push(format!("→ {new}"))
                 .println();
         }
         println!();
@@ -675,7 +617,7 @@ pub fn plan_footer() {
     mp().suspend(|| println!("\n  run `ship prepare` to ship."));
 }
 
-pub fn final_success(pr_url: Option<&str>, merged: Option<&str>, tag: Option<&str>) {
+pub fn final_success(pr_url: Option<&str>, merged: Option<&str>) {
     clear_task();
     flush_buffer();
     let mut p = Panel::new()
@@ -690,23 +632,12 @@ pub fn final_success(pr_url: Option<&str>, merged: Option<&str>, tag: Option<&st
                 .dim()
                 .push("↗ ")
                 .fg(C_PRIMARY)
-                .push(Span::new(pr).fg(C_PRIMARY).underline().link(pr)),
+                .push(pr)
+                .white(),
         );
     }
     if let Some(m) = merged {
         p = p.line(Line::new().push("Merged  ").dim().push(m).white());
-    }
-    if let Some(t) = tag {
-        p = p.line(
-            Line::new()
-                .push("Tag     ")
-                .dim()
-                .push("⚑ ")
-                .fg(C_WARN)
-                .push(t)
-                .fg(C_PRIMARY)
-                .bold(),
-        );
     }
     mp().suspend(|| {
         println!();
