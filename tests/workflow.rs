@@ -179,3 +179,28 @@ fn test_generic_pipeline_without_versioning() {
         "Should show untracked file"
     );
 }
+
+#[test]
+fn test_clean_keeps_failed_zips() {
+    let dir = tempfile::tempdir().unwrap();
+    let watch_dir = dir.path();
+    let processed = watch_dir.join(".processed");
+    let failed = watch_dir.join(".failed");
+
+    std::fs::create_dir_all(&processed).unwrap();
+    std::fs::create_dir_all(&failed).unwrap();
+
+    std::fs::write(processed.join("success.zip"), "data").unwrap();
+    std::fs::write(failed.join("error.zip"), "data").unwrap();
+
+    ship::watch::clean_processed(watch_dir).unwrap();
+
+    assert!(
+        !processed.join("success.zip").exists(),
+        "Processed zip should be deleted"
+    );
+    assert!(
+        failed.join("error.zip").exists(),
+        "Failed zip must be preserved"
+    );
+}
