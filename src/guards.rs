@@ -233,6 +233,14 @@ fn format_locks_err(stale: &[(PathBuf, u64)], fresh: &[PathBuf]) -> anyhow::Erro
 }
 
 pub fn gh_authenticated(shell: &dyn Shell) -> Result<()> {
+    // If the user provides a token via env var, trust it.
+    // This completely bypasses the macOS Keychain, which frequently locks up
+    // or stores expired tokens.
+    if std::env::var("GH_TOKEN").is_ok() || std::env::var("GITHUB_TOKEN").is_ok() {
+        return Ok(());
+    }
+
+    // Otherwise, check the keyring.
     run_checked(shell, &["gh", "auth", "status"])?;
     Ok(())
 }
