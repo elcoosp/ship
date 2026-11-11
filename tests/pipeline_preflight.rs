@@ -1,4 +1,4 @@
-use ship::manifest::{CommitGroup, Delivery, Manifest, VersionSection};
+use ship::manifest::{CommitGroup, Delivery, Manifest};
 use ship::mock_shell::MockShell;
 use ship::pipeline;
 use std::path::PathBuf;
@@ -12,9 +12,6 @@ fn mock_manifest() -> Manifest {
             remote: "origin".into(),
             base: None,
             base_commit: None,
-        },
-        version: VersionSection {
-            bump: "auto".into(),
         },
         commit: vec![CommitGroup {
             message: "feat: test".into(),
