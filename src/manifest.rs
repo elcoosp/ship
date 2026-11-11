@@ -5,14 +5,14 @@ use serde::Deserialize;
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-#[derive(Deserialize, Clone)]
+#[derive(Deserialize, Clone, Debug)]
 pub struct Manifest {
     pub delivery: Delivery,
     #[serde(default)]
     pub commit: Vec<CommitGroup>,
 }
 
-#[derive(Deserialize, Clone)]
+#[derive(Deserialize, Clone, Debug)]
 pub struct Delivery {
     pub branch: String,
     pub pr_title: String,
@@ -23,7 +23,7 @@ pub struct Delivery {
     pub base: Option<String>,
 }
 
-#[derive(Deserialize, Clone)]
+#[derive(Deserialize, Clone, Debug)]
 pub struct CommitGroup {
     pub message: String,
     pub files: Vec<PathBuf>,
@@ -61,6 +61,13 @@ impl Manifest {
         if !prefixes.contains(&prefix) {
             bail!("branch prefix '{}' not in {:?}", prefix, prefixes);
         }
+
+        if self.commit.is_empty() {
+            bail!(
+                "manifest has no [[commit]] groups — ship strictly requires commits to be grouped by intent"
+            );
+        }
+
         let re = Regex::new(
             r"^(feat|fix|docs|refactor|perf|chore|build|test|ci|style|revert)(\([^)]+\))?!?: .+$",
         )?;
