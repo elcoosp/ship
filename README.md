@@ -101,8 +101,6 @@ message = "docs: align the surface to the P2 seam"
 files   = ["README.md", "CHANGELOG.md"]
 ```
 
-> **Auto Per-File Mode:** If you omit the `[[commit]]` blocks entirely, `ship` will automatically generate one commit per dirty file using the message `chore: update <path>`. The `[delivery]` section is still required.
-
 ## Safety and Recovery
 
 > [!IMPORTANT]
