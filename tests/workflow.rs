@@ -184,8 +184,8 @@ fn test_generic_pipeline_without_versioning() {
 fn test_clean_keeps_failed_zips() {
     let dir = tempfile::tempdir().unwrap();
     let watch_dir = dir.path();
-    let processed = watch_dir.join(".processed");
-    let failed = watch_dir.join(".failed");
+    let processed = watch_dir.join(".ship-processed");
+    let failed = watch_dir.join(".ship-failed");
 
     std::fs::create_dir_all(&processed).unwrap();
     std::fs::create_dir_all(&failed).unwrap();
