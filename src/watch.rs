@@ -87,6 +87,31 @@ pub fn list_projects(repos_root: &Path) -> Result<Vec<String>> {
     Ok(projects)
 }
 
+pub fn clean_processed(watch_dir: &Path) -> Result<()> {
+    let processed_dir = watch_dir.join(".processed");
+    if !processed_dir.exists() {
+        crate::ui::info("Nothing to clean: .processed folder does not exist.");
+        return Ok(());
+    }
+
+    let mut count = 0;
+    let mut bytes = 0u64;
+
+    for entry in std::fs::read_dir(&processed_dir)?.flatten() {
+        if entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+            if let Ok(meta) = entry.metadata() {
+                bytes += meta.len();
+            }
+            if std::fs::remove_file(entry.path()).is_ok() {
+                count += 1;
+            }
+        }
+    }
+
+    crate::ui::print_clean_summary(count, bytes, &processed_dir);
+    Ok(())
+}
+
 fn clean_old_processed(dir: &Path) {
     if let Ok(entries) = std::fs::read_dir(dir) {
         let now = std::time::SystemTime::now();
