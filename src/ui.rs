@@ -384,42 +384,6 @@ pub fn commit_step(idx: usize, total: usize, subject: &str) {
     step(&format!("committed {}", counter));
 }
 
-pub fn version_step(from: &str, to: &str) {
-    let line = Line::new()
-        .push(padded_prefix())
-        .fg(C_DIM)
-        .push("✓ ")
-        .fg(C_SUCCESS)
-        .dim()
-        .push(pad("version", 10, Align::Left, ' '))
-        .dim()
-        .push(from)
-        .white()
-        .push(" → ")
-        .dim()
-        .push(to)
-        .fg(C_PRIMARY)
-        .bold();
-    print_line(&line);
-}
-
-pub fn version_skipped(at: &str, reason: &str) {
-    let line = Line::new()
-        .push(padded_prefix())
-        .fg(C_DIM)
-        .push("⏭ ")
-        .fg(C_WARN)
-        .dim()
-        .push(pad("version", 10, Align::Left, ' '))
-        .dim()
-        .push(at)
-        .white()
-        .push("  ")
-        .push(format!("({})", reason))
-        .dim();
-    print_line(&line);
-}
-
 pub fn pr_opened(url: &str) {
     let line = Line::new()
         .push(padded_prefix())
@@ -568,7 +532,7 @@ pub fn error_panel(headline: &str, detail: &str, recovery: &[String]) {
     }
 }
 
-pub fn plan_header(branch: &str, new: &str, first_release: bool) {
+pub fn plan_header(branch: &str) {
     mp().suspend(|| {
         println!(
             "
@@ -591,23 +555,6 @@ pub fn plan_header(branch: &str, new: &str, first_release: bool) {
             .push("  ")
             .push(branch)
             .println();
-        if first_release {
-            Line::new()
-                .push("  ")
-                .push(pad("release", width, Align::Left, ' '))
-                .dim()
-                .push("  ")
-                .push("first release")
-                .println();
-        } else {
-            Line::new()
-                .push("  ")
-                .push(pad("version", width, Align::Left, ' '))
-                .dim()
-                .push("  ")
-                .push(format!("→ {new}"))
-                .println();
-        }
         println!();
     });
 }
