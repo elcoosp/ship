@@ -9,8 +9,6 @@ use std::path::PathBuf;
 pub struct Manifest {
     pub delivery: Delivery,
     #[serde(default)]
-    pub version: VersionSection,
-    #[serde(default)]
     pub commit: Vec<CommitGroup>,
 }
 
@@ -23,12 +21,6 @@ pub struct Delivery {
     #[serde(default = "default_remote")]
     pub remote: String,
     pub base: Option<String>,
-}
-
-#[derive(Deserialize, Clone, Default)]
-pub struct VersionSection {
-    #[serde(default = "default_bump")]
-    pub bump: String,
 }
 
 #[derive(Deserialize, Clone)]
@@ -47,10 +39,6 @@ pub struct DropReport {
 fn default_remote() -> String {
     "origin".into()
 }
-fn default_bump() -> String {
-    "auto".into()
-}
-
 impl Manifest {
     pub fn load(path: &std::path::Path) -> Result<Self> {
         let text =
