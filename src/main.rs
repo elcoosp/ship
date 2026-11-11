@@ -55,6 +55,11 @@ enum Cmd {
         #[arg(long)]
         repos_root: Option<PathBuf>,
     },
+    /// Remove zips from .processed to free disk space (keeps .failed).
+    Clean {
+        #[arg(long)]
+        watch_dir: Option<PathBuf>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -95,6 +100,12 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    if let Cmd::Clean { watch_dir } = &cli.cmd {
+        let dir = watch_dir.clone().unwrap_or_else(watch::default_watch_dir);
+        watch::clean_processed(&dir)?;
+        return Ok(());
+    }
+
     let manifest = manifest::Manifest::load(&cli.manifest)?;
     let shell = RealShell::new(std::env::current_dir()?);
 
@@ -104,7 +115,7 @@ fn main() -> Result<()> {
             reset,
             clean_locks,
         } => pipeline::prepare(dry_run, reset, clean_locks, &manifest, &shell)?,
-        Cmd::Watch { .. } | Cmd::Projects { .. } => unreachable!(),
+        Cmd::Watch { .. } | Cmd::Projects { .. } | Cmd::Clean { .. } => unreachable!(),
     };
 
     if let Some(u) = outcome.pr_url.as_deref() {
