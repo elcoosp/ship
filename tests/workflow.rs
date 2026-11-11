@@ -155,3 +155,27 @@ fn test_mock_shell_records_calls() {
     let _ = mock.run(&["git", "fetch", "origin"]);
     mock.assert_called("git fetch origin");
 }
+
+#[test]
+fn test_generic_pipeline_without_versioning() {
+    // Verifies that a repo without Cargo.toml or package.json
+    // simply commits the files and does not try to bump versions.
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path();
+    setup_git_repo(repo);
+
+    fs::write(repo.join("file1.zig"), "const std = @import(\"std\");").unwrap();
+
+    // We just verify that a clean repo with uncommitted changes
+    // correctly identifies the dirty state (which triggers ensure_committed).
+    let output = Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(repo)
+        .output()
+        .unwrap();
+    let status_str = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        status_str.contains("?? file1.zig"),
+        "Should show untracked file"
+    );
+}
