@@ -31,8 +31,8 @@ impl Default for WatchConfig {
         let state = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()))
             .join(".local/state/ship");
         Self {
-            processed_dir: watch_dir.join(".processed"),
-            failed_dir: watch_dir.join(".failed"),
+            processed_dir: watch_dir.join(".ship-processed"),
+            failed_dir: watch_dir.join(".ship-failed"),
             watch_dir,
             repos_root: default_repos_root(),
             log_file: Some(state.join("watcher.log")),
@@ -88,7 +88,7 @@ pub fn list_projects(repos_root: &Path) -> Result<Vec<String>> {
 }
 
 pub fn clean_processed(watch_dir: &Path) -> Result<()> {
-    let processed_dir = watch_dir.join(".processed");
+    let processed_dir = watch_dir.join(".ship-processed");
     if !processed_dir.exists() {
         crate::ui::info("Nothing to clean: .processed folder does not exist.");
         return Ok(());
@@ -429,7 +429,7 @@ fn recovery_for(err: &str, project: &str, zip: &Path) -> Vec<String> {
         .unwrap_or("<zip>")
         .to_string();
     let repo = format!("~/Documents/Repos/{project}");
-    let failed_dir = "~/Downloads/.failed";
+    let failed_dir = "~/Downloads/.ship-failed";
 
     if err.contains("ship.toml ↔ working tree mismatch")
         || err.contains("invalid [version].bump")
