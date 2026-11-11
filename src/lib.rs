@@ -5,5 +5,4 @@ pub mod normalize;
 pub mod pipeline;
 pub mod shell;
 pub mod ui;
-pub mod version;
 pub mod watch;
