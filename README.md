@@ -92,9 +92,6 @@ pr_title    = "feat(compile): the lex-registry-IR seam"
 pr_body     = ".github/pr-body.md"
 base_commit = "a1b2c3d4e5f6..." # The HEAD commit the AI cloned
 
-[version]
-bump = "auto" # auto | patch | minor | major
-
 [[commit]]
 message = "feat(compile): wire the lex-registry-IR compile seam"
 files   = ["Cargo.toml", "crates/aeolus-compile/**/*.rs"]
