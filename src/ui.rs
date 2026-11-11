@@ -112,6 +112,62 @@ fn padded_prefix() -> String {
     format!("{:<12}", prefix())
 }
 
+pub fn print_clean_summary(count: usize, bytes: u64, path: &std::path::Path) {
+    if count == 0 {
+        mp().suspend(|| {
+            println!(
+                "  {}  .processed is already empty.",
+                Span::new("✨").fg(C_SUCCESS)
+            )
+        });
+        return;
+    }
+
+    let size_str = if bytes > 1024 * 1024 {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    } else if bytes > 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{} B", bytes)
+    };
+
+    let mut p = Panel::new()
+        .title("🧹 Cleaned Up")
+        .border(Style::new().fg(C_PRIMARY))
+        .width(60)
+        .padding(1);
+
+    p = p.line(
+        Line::new()
+            .push("  Removed  ")
+            .dim()
+            .push(format!("{} zips", count))
+            .white(),
+    );
+    p = p.line(
+        Line::new()
+            .push("  Freed    ")
+            .dim()
+            .push(size_str)
+            .fg(C_SUCCESS)
+            .bold(),
+    );
+    p = p.line(
+        Line::new()
+            .push("  From     ")
+            .dim()
+            .push(path.display().to_string())
+            .dim(),
+    );
+
+    mp().suspend(|| {
+        println!();
+        p.println();
+        println!("  (Failed zips in .failed/ were preserved.)");
+        println!();
+    });
+}
+
 pub fn machine(key: &str, val: &str) {
     if !std::io::stdout().is_terminal() {
         mp().suspend(|| println!("{key}={val}"));
