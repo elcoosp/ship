@@ -234,13 +234,32 @@ fn format_locks_err(stale: &[(PathBuf, u64)], fresh: &[PathBuf]) -> anyhow::Erro
 
 pub fn gh_authenticated(shell: &dyn Shell) -> Result<()> {
     // If the user provides a token via env var, trust it.
-    // This completely bypasses the macOS Keychain, which frequently locks up
-    // or stores expired tokens.
     if std::env::var("GH_TOKEN").is_ok() || std::env::var("GITHUB_TOKEN").is_ok() {
         return Ok(());
     }
 
-    // Otherwise, check the keyring.
+    // Try the normal check.
+    if run_checked(shell, &["gh", "auth", "status"]).is_ok() {
+        return Ok(());
+    }
+
+    // The keyring is broken. Try to extract the token directly and force it into the env.
+    crate::ui::warn("gh keyring is broken, attempting to extract token directly...");
+    let out = shell.run(&["gh", "auth", "token"]);
+    if let Ok(out) = out
+        && out.status == 0
+        && !out.stdout.trim().is_empty()
+    {
+        let token = out.stdout.trim().to_string();
+        // SAFETY: We are single-threaded at this point (before threads spawn).
+        unsafe {
+            std::env::set_var("GH_TOKEN", &token);
+        }
+        crate::ui::info("Successfully extracted GH_TOKEN, bypassing keyring.");
+        return Ok(());
+    }
+
+    // Both failed. Give up.
     run_checked(shell, &["gh", "auth", "status"])?;
     Ok(())
 }
