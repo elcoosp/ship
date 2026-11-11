@@ -219,12 +219,25 @@ fn merge_immediately(shell: &dyn Shell, pr_url: &str) -> Result<String> {
         "--rebase",
         "--delete-branch",
     ])?;
+
     if out.status != 0 {
-        bail!(
-            "gh pr merge --admin failed (are you a repo admin?): {}",
-            out.stderr.trim()
+        // The merge command can fail if the PR merged successfully, but the
+        // subsequent API call to delete the remote branch hit a rate limit.
+        // We check the PR state before actually bailing.
+        let state = pr_state(shell, pr_url)?;
+        if state != "MERGED" {
+            bail!(
+                "gh pr merge --admin failed (are you a repo admin?):
+{}{}",
+                out.stdout.trim(),
+                out.stderr.trim()
+            );
+        }
+        crate::ui::warn(
+            "gh pr merge reported an error, but the PR is MERGED. The remote branch might still exist.",
         );
     }
+
     for attempt in 0..3 {
         if let Some(sha) = merged_sha(shell, pr_url)? {
             return Ok(sha);

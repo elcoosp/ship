@@ -77,3 +77,21 @@ files = ["a"]
     let f = write_manifest(content);
     assert!(Manifest::load(f.path()).is_err());
 }
+
+#[test]
+fn empty_commit_groups_fails() {
+    let content = r#"
+[delivery]
+branch = "feat/test"
+pr_title = "feat: test"
+pr_body = ".github/pr-body.md"
+"#;
+    let f = write_manifest(content);
+    let res = Manifest::load(f.path());
+    assert!(res.is_err());
+    assert!(
+        res.unwrap_err()
+            .to_string()
+            .contains("manifest has no [[commit]] groups")
+    );
+}
