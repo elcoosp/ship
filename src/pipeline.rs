@@ -1,8 +1,7 @@
 use crate::guards;
 use crate::manifest::Manifest;
 use crate::shell::{Shell, run_checked};
-use crate::version;
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Result, anyhow, bail};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -65,7 +64,6 @@ pub fn prepare(
 
     crate::ui::step("fetching origin...");
     run_checked(shell, &["git", "fetch", remote, "--prune"])?;
-    let (new, first_release) = resolve_target_version(shell, remote, &default, m_orig)?;
 
     let dirty_now = if guards::is_dirty(shell)? {
         guards::dirty_paths(shell)?
@@ -98,26 +96,17 @@ pub fn prepare(
         guards::union_check(&dirty_now, &manifest_paths)?;
     }
 
-    let version_matches = version::read_workspace_version(&PathBuf::from("Cargo.toml"))
-        .map(|v| v == new)
-        .unwrap_or(false);
-
     if dry_run {
         if resume_mode {
             println!(
                 "# RESUME MODE — tree clean, all {} groups already committed",
                 m.commit.len()
             );
-            if version_matches {
-                println!("# would skip: ensure_version (already at {new})");
-            } else {
-                println!("# would run:  ensure_version (→ {new})");
-            }
             println!("# would push: {remote}/{}", m.delivery.branch);
             println!("# would open PR: {:?}", m.delivery.pr_title);
             println!("# would merge: --admin --rebase --delete-branch");
         } else {
-            print_plan(m, &default, new, first_release);
+            print_plan(m, &default);
         }
         return Ok(Outcome::default());
     }
@@ -132,13 +121,6 @@ pub fn prepare(
         ensure_no_leftover_dirty(shell)?;
     }
 
-    let current = version::read_workspace_version(&shell.cwd().join("Cargo.toml"))?;
-    if current == new {
-        crate::ui::version_skipped(&new.to_string(), "already at target");
-    } else {
-        ensure_version(shell, &current, &new)?;
-    }
-
     ensure_pushed(shell, &m.delivery.branch)?;
     let pr_url = ensure_pr(shell, m, &default)?;
     let merged = merge_immediately(shell, &pr_url)?;
@@ -151,23 +133,6 @@ pub fn prepare(
         pr_url: Some(pr_url),
         merged: Some(merged),
     })
-}
-
-fn resolve_target_version(
-    shell: &dyn Shell,
-    remote: &str,
-    default: &str,
-    m: &Manifest,
-) -> Result<(version::Version, bool)> {
-    let level = resolve_bump_level(m)?;
-    if let Some(old) =
-        version::read_workspace_version_at_opt(shell, &format!("{remote}/{default}"), "Cargo.toml")?
-    {
-        return Ok((old.bump(level), false));
-    }
-    let new = version::read_workspace_version(&shell.cwd().join("Cargo.toml"))
-        .context("cannot find origin manifest or local Cargo.toml")?;
-    Ok((new, true))
 }
 
 fn report_drops(original: &Manifest, expanded: &Manifest, drops: &crate::manifest::DropReport) {
@@ -198,20 +163,16 @@ fn report_drops(original: &Manifest, expanded: &Manifest, drops: &crate::manifes
     }
 }
 
-fn print_plan(m: &Manifest, default: &str, new: version::Version, first_release: bool) {
+fn print_plan(m: &Manifest, default: &str) {
     let _ = default;
-    crate::ui::plan_header(&m.delivery.branch, &new.to_string(), first_release);
-    if m.commit.is_empty() {
-        crate::ui::plan_commit(0, 1, "auto per-file commits (chore: update <file>)");
-    } else {
-        let non_empty = m.commit.iter().filter(|g| !g.files.is_empty()).count();
-        for (i, g) in m.commit.iter().enumerate() {
-            if g.files.is_empty() {
-                continue;
-            }
-            let label = format!("{}  ({} files)", g.message, g.files.len());
-            crate::ui::plan_commit(i, non_empty, &label);
+    crate::ui::plan_header(&m.delivery.branch);
+    let non_empty = m.commit.iter().filter(|g| !g.files.is_empty()).count();
+    for (i, g) in m.commit.iter().enumerate() {
+        if g.files.is_empty() {
+            continue;
         }
+        let label = format!("{}  ({} files)", g.message, g.files.len());
+        crate::ui::plan_commit(i, non_empty, &label);
     }
     crate::ui::plan_footer();
 }
@@ -236,25 +197,6 @@ fn ensure_no_leftover_dirty(shell: &dyn Shell) -> Result<()> {
         shown.join("\n"),
         extra
     );
-}
-
-fn resolve_bump_level(m: &Manifest) -> Result<version::BumpLevel> {
-    let derived = version::derive_bump(m);
-    let declared = match m.version.bump.as_str() {
-        "auto" => derived,
-        "patch" => version::BumpLevel::Patch,
-        "minor" => version::BumpLevel::Minor,
-        "major" => version::BumpLevel::Major,
-        other => bail!("invalid [version].bump = {:?}", other),
-    };
-    if declared < derived {
-        bail!(
-            "manifest declares bump={:?} but commits demand at least {:?}",
-            declared,
-            derived
-        );
-    }
-    Ok(declared)
 }
 
 fn merge_immediately(shell: &dyn Shell, pr_url: &str) -> Result<String> {
@@ -389,25 +331,6 @@ fn ensure_on_branch(shell: &dyn Shell, m: &Manifest, remote: &str, default: &str
 
 fn ensure_committed(shell: &dyn Shell, m: &Manifest, remote: &str, default: &str) -> Result<()> {
     let base = format!("{remote}/{default}");
-
-    if m.commit.is_empty() {
-        // Auto per-file mode
-        let dirty = guards::dirty_paths(shell)?;
-        let total = dirty.len();
-        for (idx, path) in dirty.into_iter().enumerate() {
-            let path_str = path.to_string_lossy();
-            let msg = format!("chore: update {}", path_str);
-            run_checked(shell, &["git", "add", "--", &path_str])?;
-            let status_out = shell.run(&["git", "status", "--porcelain"])?;
-            if status_out.stdout.trim().is_empty() {
-                continue;
-            }
-            run_checked(shell, &["git", "commit", "--no-verify", "-m", &msg])?;
-            crate::ui::commit_step(idx + 1, total, &msg);
-        }
-        return Ok(());
-    }
-
     let total = m.commit.len();
     for (idx, g) in m.commit.iter().enumerate() {
         if g.files.is_empty() {
@@ -441,31 +364,9 @@ fn ensure_committed(shell: &dyn Shell, m: &Manifest, remote: &str, default: &str
         if let Ok(out) = &commit_res
             && out.status != 0
         {
-            eprintln!(
-                "
---- GIT COMMIT FAILED ---"
-            );
-            eprintln!("Command: git commit --no-verify -m {:?}", g.message);
-            eprintln!("Exit code: {}", out.status);
-            eprintln!(
-                "Stdout:
-{}",
-                out.stdout
-            );
-            eprintln!(
-                "Stderr:
-{}",
-                out.stderr
-            );
-            eprintln!(
-                "Git Status:
-{}",
-                status_out.stdout
-            );
-            eprintln!(
-                "-------------------------
-"
-            );
+            crate::ui::warn(&format!("git commit failed for '{}'", g.message));
+            crate::ui::info(&format!("stdout: {}", out.stdout.trim()));
+            crate::ui::info(&format!("stderr: {}", out.stderr.trim()));
         }
         commit_res?;
         crate::ui::commit_step(idx + 1, total, &g.message);
@@ -480,37 +381,6 @@ fn already_committed(shell: &dyn Shell, message: &str, base: &str) -> Result<boo
         return Ok(false);
     }
     Ok(out.stdout.lines().any(|l| l.trim() == subject.trim()))
-}
-
-fn ensure_version(shell: &dyn Shell, old: &version::Version, new: &version::Version) -> Result<()> {
-    if old == new {
-        return Ok(());
-    }
-    let new_s = new.to_string();
-    guards::require_command(
-        shell,
-        &["cargo", "set-version", "--version"],
-        "cargo install cargo-edit",
-    )?;
-    run_checked(shell, &["cargo", "set-version", "--workspace", &new_s])?;
-    if let Ok(text) = std::fs::read_to_string(shell.cwd().join("package.json")) {
-        let mut v: serde_json::Value = serde_json::from_str(&text).context("parse package.json")?;
-        if v.get("version").and_then(|x| x.as_str()) == Some(&old.to_string()) {
-            v["version"] = serde_json::Value::String(new_s.clone());
-            std::fs::write(
-                shell.cwd().join("package.json"),
-                serde_json::to_string_pretty(&v)? + "\n",
-            )?;
-        }
-    }
-    run_checked(shell, &["git", "add", "-A"])?;
-    if !guards::staged_is_empty(shell)? {
-        run_checked(
-            shell,
-            &["git", "commit", "-m", &format!("chore(release): v{new}")],
-        )?;
-    }
-    Ok(())
 }
 
 fn ensure_pushed(shell: &dyn Shell, branch: &str) -> Result<()> {
