@@ -112,6 +112,53 @@ fn padded_prefix() -> String {
     format!("{:<12}", prefix())
 }
 
+pub fn validate_success(m: &crate::manifest::Manifest) {
+    mp().suspend(|| {
+        println!();
+        let mut p = Panel::new()
+            .title("✅ Valid ship.toml")
+            .border(Style::new().fg(C_SUCCESS))
+            .width(74)
+            .padding(2);
+
+        p = p.line(
+            Line::new()
+                .push("  Branch    ")
+                .dim()
+                .push(m.delivery.branch.as_str())
+                .fg(C_PRIMARY)
+                .bold(),
+        );
+        p = p.line(
+            Line::new()
+                .push("  Title     ")
+                .dim()
+                .push(m.delivery.pr_title.as_str())
+                .white(),
+        );
+
+        let total_files: usize = m.commit.iter().map(|g| g.files.len()).sum();
+        p = p.line(
+            Line::new()
+                .push("  Commits   ")
+                .dim()
+                .push(format!("{} groups", m.commit.len()))
+                .white(),
+        );
+        p = p.line(
+            Line::new()
+                .push("  Files     ")
+                .dim()
+                .push(format!("{} paths", total_files))
+                .white(),
+        );
+
+        p.println();
+        println!("  Ready to ship. Drop the zip into ~/Downloads.");
+        println!();
+    });
+}
+
 pub fn print_clean_summary(count: usize, bytes: u64, path: &std::path::Path) {
     if count == 0 {
         mp().suspend(|| {

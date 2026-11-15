@@ -55,11 +55,13 @@ enum Cmd {
         #[arg(long)]
         repos_root: Option<PathBuf>,
     },
-    /// Remove zips from .processed to free disk space (keeps .failed).
+    /// Remove zips from .ship-processed to free disk space (keeps .ship-failed).
     Clean {
         #[arg(long)]
         watch_dir: Option<PathBuf>,
     },
+    /// Validate ship.toml without running the pipeline.
+    Validate,
 }
 
 fn main() -> Result<()> {
@@ -106,6 +108,28 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    if let Cmd::Validate = &cli.cmd {
+        let shell = RealShell::new(std::env::current_dir()?);
+        let res = manifest::Manifest::load(&cli.manifest).and_then(|m| {
+            pipeline::validate(&m, &shell, "HEAD")?;
+            Ok(m)
+        });
+        match res {
+            Ok(m) => {
+                ship::ui::validate_success(&m);
+                return Ok(());
+            }
+            Err(e) => {
+                ship::ui::error_panel(
+                    "Invalid ship.toml or tree",
+                    &format!("{e:#}"),
+                    &["Fix the errors above, then re-run `ship validate`.".into()],
+                );
+                std::process::exit(1);
+            }
+        }
+    }
+
     let manifest = manifest::Manifest::load(&cli.manifest)?;
     let shell = RealShell::new(std::env::current_dir()?);
 
@@ -115,7 +139,9 @@ fn main() -> Result<()> {
             reset,
             clean_locks,
         } => pipeline::prepare(dry_run, reset, clean_locks, &manifest, &shell)?,
-        Cmd::Watch { .. } | Cmd::Projects { .. } | Cmd::Clean { .. } => unreachable!(),
+        Cmd::Watch { .. } | Cmd::Projects { .. } | Cmd::Clean { .. } | Cmd::Validate => {
+            unreachable!()
+        }
     };
 
     if let Some(u) = outcome.pr_url.as_deref() {

@@ -27,12 +27,6 @@ pub fn prepare(
     guards::local_default_not_ahead(shell, remote, &default)?;
     let _email = guards::config_email(shell)?;
     let _name = guards::config_name(shell)?;
-    guards::ship_artifacts_gitignored(
-        shell,
-        &PathBuf::from("ship.toml"),
-        &PathBuf::from(&m_orig.delivery.pr_body),
-    )?;
-
     // Revert spurious chmod +x from a zip produced with `chmod -R +x`.
     let reverted = crate::normalize::exec_bit(shell)?;
     if reverted > 0 {
@@ -65,36 +59,9 @@ pub fn prepare(
     crate::ui::step("fetching origin...");
     run_checked(shell, &["git", "fetch", remote, "--prune"])?;
 
-    let dirty_now = if guards::is_dirty(shell)? {
-        guards::dirty_paths(shell)?
-    } else {
-        let all_committed = m_orig.commit.iter().all(|g| {
-            let subject = g.message.lines().next().unwrap_or("");
-            already_committed(shell, subject, &format!("{remote}/{default}")).unwrap_or(false)
-        });
-        if !all_committed {
-            bail!(
-                "working tree is clean and not all [[commit]] groups are on the branch — \
-                 extract the zip into the repo, or check ship.toml"
-            );
-        }
-        Vec::new()
-    };
-    let resume_mode = dirty_now.is_empty();
-
-    let (expanded, drops) = m_orig.expand_globs(&dirty_now)?;
-    if !resume_mode {
-        report_drops(m_orig, &expanded, &drops);
-    }
+    let (expanded, _dirty_now, resume_mode) =
+        validate(m_orig, shell, &format!("{remote}/{default}"))?;
     let m = &expanded;
-
-    if !resume_mode {
-        let mut manifest_paths = Vec::new();
-        for g in &m.commit {
-            manifest_paths.extend(g.files.iter().cloned());
-        }
-        guards::union_check(&dirty_now, &manifest_paths)?;
-    }
 
     if dry_run {
         if resume_mode {
@@ -509,4 +476,48 @@ fn ensure_synced(shell: &dyn Shell, default: &str, remote: &str, merged: &str) -
         bail!("after sync, HEAD is {head} but the merged SHA was {merged} — origin moved mid-run");
     }
     Ok(())
+}
+
+pub fn validate(
+    m_orig: &Manifest,
+    shell: &dyn Shell,
+    base: &str,
+) -> Result<(Manifest, Vec<PathBuf>, bool)> {
+    guards::ship_artifacts_gitignored(
+        shell,
+        &PathBuf::from("ship.toml"),
+        &PathBuf::from(&m_orig.delivery.pr_body),
+    )?;
+
+    let dirty_now = if guards::is_dirty(shell)? {
+        guards::dirty_paths(shell)?
+    } else {
+        let all_committed = m_orig.commit.iter().all(|g| {
+            let subject = g.message.lines().next().unwrap_or("");
+            already_committed(shell, subject, base).unwrap_or(false)
+        });
+        if !all_committed {
+            bail!(
+                "working tree is clean and not all [[commit]] groups are on the branch — \
+                 extract the zip into the repo, or check ship.toml"
+            );
+        }
+        Vec::new()
+    };
+    let resume_mode = dirty_now.is_empty();
+
+    let (expanded, drops) = m_orig.expand_globs(&dirty_now)?;
+    if !resume_mode {
+        report_drops(m_orig, &expanded, &drops);
+    }
+
+    if !resume_mode {
+        let mut manifest_paths = Vec::new();
+        for g in &expanded.commit {
+            manifest_paths.extend(g.files.iter().cloned());
+        }
+        guards::union_check(&dirty_now, &manifest_paths)?;
+    }
+
+    Ok((expanded, dirty_now, resume_mode))
 }
