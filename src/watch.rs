@@ -603,16 +603,34 @@ fn process_zip_inner(
                 &["git", "switch", "-C", branch, &format!("origin/{default}")],
             )?;
             let merge = shell.run(&["git", "merge", ai_branch, "--no-commit", "--no-ff"])?;
+
+            if merge.status != 0 {
+                // Check if it's actually a merge conflict
+                let conflicts_out =
+                    shell.run(&["git", "diff", "--name-only", "--diff-filter=U"])?;
+                if !conflicts_out.stdout.trim().is_empty() {
+                    crate::ui::warn(
+                        "Merge conflict detected! Auto-resolving by favoring the AI's changes.",
+                    );
+                    crate::ui::info(&format!("Conflicted files:\n{}", conflicts_out.stdout));
+                    for file in conflicts_out.stdout.lines() {
+                        let _ = shell.run(&["git", "checkout", "--theirs", "--", file]);
+                        let _ = shell.run(&["git", "add", "--", file]);
+                    }
+                    crate::ui::warn(
+                        "Your recent manual edits to these files were overwritten by the AI.",
+                    );
+                } else {
+                    // Merge failed for some other reason
+                    let _ = shell.run(&["git", "merge", "--abort"]);
+                    let _ = shell.run(&["git", "branch", "-D", ai_branch]);
+                    let _ = std::fs::remove_dir_all(&tmp);
+                    bail!("Merge failed: {}", merge.stderr.trim());
+                }
+            }
+
             // Unstage the merge so ensure_committed can group the files correctly.
             let _ = shell.run(&["git", "reset"]);
-            if merge.status != 0 {
-                let _ = shell.run(&["git", "merge", "--abort"]);
-                let _ = shell.run(&["git", "branch", "-D", ai_branch]);
-                let _ = std::fs::remove_dir_all(&tmp);
-                bail!(
-                    "Merge conflict! The AI's zip touches the same lines as your recent pushes.\nPlease resolve manually or regenerate the zip from the latest main."
-                );
-            }
             let _ = shell.run(&["git", "branch", "-D", ai_branch]);
 
             // Re-copy untracked config files (ship.toml, pr-body) that were removed by `git rm`
