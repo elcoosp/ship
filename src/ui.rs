@@ -242,7 +242,7 @@ pub fn banner_startup() {
         println!();
 
         let width = 33.0;
-        let frames = 40;
+        let frames = 16;
 
         for frame in 0..frames {
             if frame > 0 {
