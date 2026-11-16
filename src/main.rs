@@ -49,6 +49,15 @@ enum Cmd {
         /// Poll interval in milliseconds (default 2000).
         #[arg(long, default_value_t = 2000)]
         poll_interval_ms: u64,
+        /// Delivery engine: gix (in-process gitoxide) or cli (legacy).
+        #[arg(long, default_value = "gix")]
+        engine: String,
+        /// Merge strategy: auto (direct push, PR as receipt), direct, via-pr.
+        #[arg(long, default_value = "auto")]
+        merge: String,
+        /// Settle window in ms (zip size must be stable for this long).
+        #[arg(long, default_value_t = 200)]
+        settle_ms: u64,
     },
     /// List detected projects under repos_root.
     Projects {
@@ -76,6 +85,9 @@ fn main() -> Result<()> {
         clean_locks,
         poll,
         poll_interval_ms,
+        engine,
+        merge,
+        settle_ms,
     } = &cli.cmd
     {
         let mut cfg = WatchConfig::default();
@@ -92,6 +104,14 @@ fn main() -> Result<()> {
         cfg.clean_locks = *clean_locks;
         cfg.poll_only = *poll;
         cfg.poll_interval = Duration::from_millis(*poll_interval_ms);
+        cfg.engine_cli = engine.eq_ignore_ascii_case("cli");
+        cfg.merge_mode = match merge.as_str() {
+            "direct" => ship::pipeline::MergeMode::Direct,
+            "via-pr" => ship::pipeline::MergeMode::ViaPr,
+            "auto" => ship::pipeline::MergeMode::Auto,
+            other => anyhow::bail!("unknown --merge value '{other}' (auto|direct|via-pr)"),
+        };
+        cfg.settle = Duration::from_millis(*settle_ms);
         return watch::run(cfg, *once);
     }
 
