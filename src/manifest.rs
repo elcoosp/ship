@@ -43,7 +43,11 @@ impl Manifest {
     pub fn load(path: &std::path::Path) -> Result<Self> {
         let text =
             std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-        let m: Manifest = toml::from_str(&text).context("parsing ship.toml")?;
+        Self::from_text(&text)
+    }
+
+    pub fn from_text(text: &str) -> Result<Self> {
+        let m: Manifest = toml::from_str(text).context("parsing ship.toml")?;
         m.validate()?;
         Ok(m)
     }
