@@ -115,11 +115,10 @@ pub fn local_default_not_ahead(shell: &dyn Shell, remote: &str, default: &str) -
     Ok(())
 }
 
+/// P0: filesystem checks against the git dir (1 spawn) instead of 6 spawns.
 pub fn no_git_operation_in_progress(shell: &dyn Shell) -> Result<()> {
-    let check = |name: &str| -> Result<bool> {
-        let out = run_checked(shell, &["git", "rev-parse", "--git-path", name])?;
-        Ok(Path::new(out.stdout.trim()).exists())
-    };
+    let out = run_checked(shell, &["git", "rev-parse", "--absolute-git-dir"])?;
+    let git_dir = PathBuf::from(out.stdout.trim());
     for marker in [
         "MERGE_HEAD",
         "CHERRY_PICK_HEAD",
@@ -128,7 +127,7 @@ pub fn no_git_operation_in_progress(shell: &dyn Shell) -> Result<()> {
         "rebase-apply",
         "BISECT_LOG",
     ] {
-        if check(marker)? {
+        if git_dir.join(marker).exists() {
             bail!("a git {marker} operation is in progress — finish or abort it first");
         }
     }
@@ -203,7 +202,7 @@ pub fn ensure_no_git_locks(shell: &dyn Shell, clean_stale: bool) -> Result<()> {
         if attempt == 19 {
             return Err(format_locks_err(&[], &fresh));
         }
-        std::thread::sleep(std::time::Duration::from_millis(500));
+        std::thread::sleep(std::time::Duration::from_millis(250));
     }
     Ok(())
 }
@@ -215,7 +214,7 @@ fn format_locks_err(stale: &[(PathBuf, u64)], fresh: &[PathBuf]) -> anyhow::Erro
     }
     for p in fresh {
         msg.push_str(&format!(
-            "  FRESH (<30s, retried 10s without clearing): {}\n",
+            "  FRESH (<30s, retried without clearing): {}\n",
             p.display()
         ));
     }
@@ -233,33 +232,25 @@ fn format_locks_err(stale: &[(PathBuf, u64)], fresh: &[PathBuf]) -> anyhow::Erro
 }
 
 pub fn gh_authenticated(shell: &dyn Shell) -> Result<()> {
-    // If the user provides a token via env var, trust it.
+    // Trust an explicit token first.
     if std::env::var("GH_TOKEN").is_ok() || std::env::var("GITHUB_TOKEN").is_ok() {
         return Ok(());
     }
-
-    // Try the normal check.
-    if run_checked(shell, &["gh", "auth", "status"]).is_ok() {
-        return Ok(());
-    }
-
-    // The keyring is broken. Try to extract the token directly and force it into the env.
-    crate::ui::warn("gh keyring is broken, attempting to extract token directly...");
-    let out = shell.run(&["gh", "auth", "token"]);
-    if let Ok(out) = out
+    // Extract the token directly BEFORE `gh auth status`: this works even when the
+    // keyring is broken and avoids a failing status round-trip on every delivery.
+    if let Ok(out) = shell.run(&["gh", "auth", "token"])
         && out.status == 0
         && !out.stdout.trim().is_empty()
     {
         let token = out.stdout.trim().to_string();
-        // SAFETY: We are single-threaded at this point (before threads spawn).
+        // SAFETY: single-threaded at this point (before worker threads spawn).
         unsafe {
             std::env::set_var("GH_TOKEN", &token);
         }
-        crate::ui::info("Successfully extracted GH_TOKEN, bypassing keyring.");
+        crate::ui::info("GH_TOKEN extracted (keyring bypass)");
         return Ok(());
     }
-
-    // Both failed. Give up.
+    // No extractable token: canonical check surfaces the real error.
     run_checked(shell, &["gh", "auth", "status"])?;
     Ok(())
 }
