@@ -1,7 +1,9 @@
 use crate::guards;
 use crate::manifest::Manifest;
 use crate::shell::{Shell, run_checked};
+use crate::{engine, trace, zipmem};
 use anyhow::{Result, anyhow, bail};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -11,6 +13,31 @@ pub struct Outcome {
     pub merged: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MergeMode {
+    /// Try direct push to default branch (PR becomes a receipt), fall back to via-pr.
+    #[default]
+    Auto,
+    /// Force direct push; fail if rejected.
+    Direct,
+    /// Legacy gh pr merge --admin --rebase with fast backoff polling.
+    ViaPr,
+}
+
+pub struct EngineInput {
+    pub repo_path: PathBuf,
+    pub entries: Vec<zipmem::Entry>,
+    pub base_commit: Option<String>,
+}
+
+#[derive(Default)]
+pub struct PrepareOpts {
+    pub merge_mode: MergeMode,
+    pub engine: Option<EngineInput>,
+    pub default: Option<String>,
+}
+
+/// Legacy entry point (CLI engine, Auto merge). Kept for tests and `ship prepare`.
 pub fn prepare(
     dry_run: bool,
     reset: bool,
@@ -18,8 +45,31 @@ pub fn prepare(
     m_orig: &Manifest,
     shell: &dyn Shell,
 ) -> Result<Outcome> {
+    prepare_with(
+        dry_run,
+        reset,
+        clean_locks,
+        m_orig,
+        shell,
+        PrepareOpts::default(),
+    )
+}
+
+pub fn prepare_with(
+    dry_run: bool,
+    reset: bool,
+    clean_locks: bool,
+    m_orig: &Manifest,
+    shell: &dyn Shell,
+    opts: PrepareOpts,
+) -> Result<Outcome> {
+    let total = std::time::Instant::now();
+    trace::reset_spawns();
     let remote = &m_orig.delivery.remote;
-    let default = guards::default_branch(shell, remote)?;
+    let default = match opts.default {
+        Some(d) => d,
+        None => guards::default_branch(shell, remote)?,
+    };
 
     guards::gh_authenticated(shell)?;
     guards::ensure_no_git_locks(shell, clean_locks)?;
@@ -27,15 +77,28 @@ pub fn prepare(
     guards::local_default_not_ahead(shell, remote, &default)?;
     let _email = guards::config_email(shell)?;
     let _name = guards::config_name(shell)?;
-    // Revert spurious chmod +x from a zip produced with `chmod -R +x`.
-    let reverted = crate::normalize::exec_bit(shell)?;
-    if reverted > 0 {
-        crate::ui::warn(&format!(
-            "reverted spurious mode changes on {reverted} tracked file(s)"
-        ));
+    // Artifacts guard runs FIRST so .gitignore is updated before any ignore filtering.
+    guards::ship_artifacts_gitignored(
+        shell,
+        &PathBuf::from("ship.toml"),
+        &PathBuf::from(&m_orig.delivery.pr_body),
+    )?;
+
+    let engine_mode = opts.engine.is_some();
+    if !engine_mode {
+        // Revert spurious chmod +x from a zip produced with `chmod -R +x` (once).
+        let reverted = crate::normalize::exec_bit(shell)?;
+        if reverted > 0 {
+            crate::ui::warn(&format!(
+                "reverted spurious mode changes on {reverted} tracked file(s)"
+            ));
+        }
     }
 
     if reset {
+        if engine_mode {
+            bail!("--reset is only supported with the CLI engine (--engine cli)");
+        }
         let base = run_checked(
             shell,
             &["git", "merge-base", &format!("{remote}/{default}"), "HEAD"],
@@ -56,12 +119,35 @@ pub fn prepare(
         }
     }
 
+    // ONE fetch for the whole run (was 3-4).
     crate::ui::step("fetching origin...");
-    run_checked(shell, &["git", "fetch", remote, "--prune"])?;
+    {
+        let _p = trace::phase("fetch");
+        run_checked(shell, &["git", "fetch", "--no-tags", remote, &default])?;
+    }
 
-    let (expanded, _dirty_now, resume_mode) =
-        validate(m_orig, shell, &format!("{remote}/{default}"))?;
-    let m = &expanded;
+    let base_ref = format!("{remote}/{default}");
+    let (m, engine_prep, resume_mode) = if let Some(input) = opts.engine {
+        let prep = engine::prepare_tree(
+            shell,
+            &input.repo_path,
+            input.entries,
+            input.base_commit.as_deref(),
+            remote,
+            &default,
+        )?;
+        let (expanded, drops) = m_orig.expand_globs(&prep.dirty)?;
+        report_drops(m_orig, &expanded, &drops);
+        let mut manifest_paths = Vec::new();
+        for g in &expanded.commit {
+            manifest_paths.extend(g.files.iter().cloned());
+        }
+        guards::union_check(&prep.dirty, &manifest_paths)?;
+        (expanded, Some(prep), false)
+    } else {
+        let (expanded, _dirty, resume) = validate_inner(m_orig, shell, &base_ref)?;
+        (expanded, None, resume)
+    };
 
     if dry_run {
         if resume_mode {
@@ -71,9 +157,9 @@ pub fn prepare(
             );
             println!("# would push: {remote}/{}", m.delivery.branch);
             println!("# would open PR: {:?}", m.delivery.pr_title);
-            println!("# would merge: --admin --rebase --delete-branch");
+            println!("# would merge: mode {:?}", opts.merge_mode);
         } else {
-            print_plan(m, &default);
+            print_plan(&m, &default);
         }
         return Ok(Outcome::default());
     }
@@ -82,24 +168,124 @@ pub fn prepare(
         crate::ui::resume();
     }
 
-    ensure_on_branch(shell, m, remote, &default)?;
-    if !resume_mode {
-        ensure_committed(shell, m, remote, &default)?;
+    if let Some(prep) = engine_prep {
+        let tip = engine::commit_groups(shell, &prep, &m, &m.delivery.branch)?;
+        crate::ui::info(&format!("engine tip: {tip}"));
         ensure_no_leftover_dirty(shell)?;
+    } else {
+        ensure_on_branch(shell, &m, remote, &default)?;
+        if !resume_mode {
+            ensure_committed(shell, &m, remote, &default)?;
+            ensure_no_leftover_dirty(shell)?;
+        }
     }
 
-    ensure_pushed(shell, &m.delivery.branch)?;
-    let pr_url = ensure_pr(shell, m, &default)?;
-    let merged = merge_immediately(shell, &pr_url)?;
-    crate::ui::merged(&merged);
+    // OPTIMISATION ULTIME : Single Push.
+    // On pousse la branche ET main en une seule négociation git.
+    // Cela élimine le push initial de la branche (~2.3s) et réduit les handshakes TLS.
+    // Une fois main mis à jour, on crée le PR, que GitHub marque instantanément comme "Merged".
+    let tip = head_sha(shell)?;
+    let refspec_branch = format!("{}:{}", tip, m.delivery.branch);
+    let refspec_main = format!("{}:{}", tip, default);
 
-    ensure_synced(shell, &default, remote, &merged)?;
+    let pr_url: Option<String>;
+
+    let merged = match opts.merge_mode {
+        MergeMode::ViaPr => {
+            // Fallback legacy : push branche puis gh pr merge
+            let _p = trace::phase("push");
+            ensure_pushed(shell, remote, &m.delivery.branch)?;
+            pr_url = Some(ensure_pr(shell, &m, &default)?);
+            merge_via_pr(
+                shell,
+                pr_url.as_ref().unwrap(),
+                &m.delivery.branch,
+                remote,
+                &default,
+            )?
+        }
+        MergeMode::Direct | MergeMode::Auto => {
+            let _p = trace::phase("push_atomic");
+            crate::ui::step("single push (branch + main)...");
+            // Get the exact SHA of origin/main to protect it from concurrent pushes
+            let expected_main_sha =
+                run_checked(shell, &["git", "rev-parse", &format!("{remote}/{default}")])?
+                    .stdout
+                    .trim()
+                    .to_string();
+
+            let out = shell.run(&[
+                "git",
+                "push",
+                "--no-verify",
+                "--force", // Force the delivery branch (bypasses stale tracking ref issues)
+                &format!("--force-with-lease={}:{}", default, expected_main_sha), // BUT strictly protect main!
+                remote,
+                &refspec_branch,
+                &refspec_main,
+            ])?;
+            if out.status == 0 {
+                crate::ui::info(
+                    "single push succeeded: branch and main updated in one network round-trip",
+                );
+                spawn_branch_delete(shell.cwd(), remote, &m.delivery.branch);
+
+                // Créer le PR après coup pour la trace. GitHub le marquera "Merged" car tip est dans main.
+                let _p_pr = trace::phase("pr");
+                pr_url = Some(ensure_pr(shell, &m, &default)?);
+                crate::ui::merged(&tip);
+                tip
+            } else {
+                // Fallback si le push de main est rejeté (branch protection)
+                crate::ui::warn(&format!(
+                    "single push to main rejected:
+{}
+{}
+
+                     Hint: This repo likely has branch protection rules on '{default}'.
+                     Options:
+                       1. Disable branch protection on {default} (if you're the owner)
+                       2. Use --merge via-pr flag to skip single push for this delivery
+                       3. Accept the fallback (slower but correct)",
+                    out.stdout.trim(),
+                    out.stderr.trim()
+                ));
+                if opts.merge_mode == MergeMode::Direct {
+                    bail!("direct push to {default} rejected and --merge direct was forced");
+                }
+                let _p_fallback = trace::phase("push_fallback");
+                ensure_pushed(shell, remote, &m.delivery.branch)?;
+                pr_url = Some(ensure_pr(shell, &m, &default)?);
+                merge_via_pr(
+                    shell,
+                    pr_url.as_ref().unwrap(),
+                    &m.delivery.branch,
+                    remote,
+                    &default,
+                )?
+            }
+        }
+    };
+
+    if opts.merge_mode == MergeMode::ViaPr || merged != head_sha(shell)? {
+        ensure_synced(shell, &default, remote, &merged)?;
+    }
     guards::verify_author(shell)?;
 
+    trace::event("total", "prepare", total.elapsed().as_secs_f64() * 1000.0);
+    trace::summary("prepare");
+
     Ok(Outcome {
-        pr_url: Some(pr_url),
+        pr_url,
         merged: Some(merged),
     })
+}
+
+fn head_sha(shell: &dyn Shell) -> Result<String> {
+    Ok(run_checked(shell, &["git", "rev-parse", "HEAD"])?
+        .stdout
+        .trim()
+        .to_string())
 }
 
 fn report_drops(original: &Manifest, expanded: &Manifest, drops: &crate::manifest::DropReport) {
@@ -163,97 +349,97 @@ fn ensure_no_leftover_dirty(shell: &dyn Shell) -> Result<()> {
         "working tree still dirty after all commits:\n{}{}\nAdd these paths to ship.toml (or gitignore them).",
         shown.join("\n"),
         extra
-    );
+    )
 }
 
-fn merge_immediately(shell: &dyn Shell, pr_url: &str) -> Result<String> {
-    let state = pr_state(shell, pr_url)?;
-    match state.as_str() {
-        "MERGED" => {
-            return merged_sha(shell, pr_url)?
-                .ok_or_else(|| anyhow!("PR is MERGED but mergeCommit.oid is empty"));
-        }
-        "CLOSED" => bail!("PR {pr_url} is CLOSED — not merging"),
-        _ => {}
-    }
-    crate::ui::step("merging PR (--admin)...");
-    let out = shell.run(&[
-        "gh",
-        "pr",
-        "merge",
-        pr_url,
-        "--admin",
-        "--rebase",
-        "--delete-branch",
-    ])?;
-
-    if out.status != 0 {
-        // The merge command can fail if the PR merged successfully, but the
-        // subsequent API call to delete the remote branch hit a rate limit.
-        // We check the PR state before actually bailing.
-        let state = pr_state(shell, pr_url)?;
-        if state != "MERGED" {
-            bail!(
-                "gh pr merge --admin failed (are you a repo admin?):
-{}{}",
-                out.stdout.trim(),
-                out.stderr.trim()
-            );
-        }
-        crate::ui::warn(
-            "gh pr merge reported an error, but the PR is MERGED. The remote branch might still exist.",
-        );
-    }
-
-    for attempt in 0..3 {
-        if let Some(sha) = merged_sha(shell, pr_url)? {
-            return Ok(sha);
-        }
-        if attempt < 2 {
-            std::thread::sleep(Duration::from_secs(5));
-        }
-    }
-    bail!("gh pr merge --admin returned 0 but mergeCommit.oid is still empty after 10s")
-}
-
-fn pr_state(shell: &dyn Shell, pr_url: &str) -> Result<String> {
-    Ok(run_checked(
-        shell,
-        &[
-            "gh", "pr", "view", pr_url, "--json", "state", "--jq", ".state",
-        ],
-    )?
-    .stdout
-    .trim()
-    .to_string())
-}
-
-fn merged_sha(shell: &dyn Shell, pr_url: &str) -> Result<Option<String>> {
+/// Combined state+mergeCommit view: ONE gh call per poll instead of two.
+fn pr_view(shell: &dyn Shell, pr_url: &str) -> Result<(String, Option<String>)> {
     let out = run_checked(
         shell,
-        &[
-            "gh",
-            "pr",
-            "view",
-            pr_url,
-            "--json",
-            "mergeCommit",
-            "--jq",
-            r#".mergeCommit.oid // empty"#,
-        ],
-    )?
-    .stdout;
-    let s = out.trim();
-    if s.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(s.to_string()))
+        &["gh", "pr", "view", pr_url, "--json", "state,mergeCommit"],
+    )?;
+    let v: serde_json::Value = serde_json::from_str(&out.stdout)
+        .map_err(|e| anyhow!("cannot parse gh pr view output: {e}"))?;
+    let state = v["state"].as_str().unwrap_or("").to_string();
+    let oid = v["mergeCommit"]["oid"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    Ok((state, oid))
+}
+
+fn spawn_branch_delete(cwd: &std::path::Path, remote: &str, branch: &str) {
+    // Fire-and-forget: branch deletion is cosmetic; rate limits must not fail the run.
+    let cwd = cwd.to_path_buf();
+    let remote = remote.to_string();
+    let branch = branch.to_string();
+    std::thread::spawn(move || {
+        let _ = std::process::Command::new("git")
+            .args(["push", &remote, "--delete", &branch])
+            .current_dir(&cwd)
+            .output();
+    });
+}
+
+/// P2: the branch is already rebased on origin/default by the 3-way merge, so
+/// fast-forwarding the default branch ourselves makes GitHub mark the PR as
+/// MERGED (head commits reachable from base). The merged SHA is known locally:
+/// no server-side rebase, no mergeCommit polling, no extra fetch.
+/// Legacy admin rebase merge, with 250ms exponential backoff instead of 2x5s sleeps.
+fn merge_via_pr(
+    shell: &dyn Shell,
+    pr_url: &str,
+    branch: &str,
+    remote: &str,
+    default: &str,
+) -> Result<String> {
+    let _p = trace::phase("merge.via_pr");
+    let (state, oid) = pr_view(shell, pr_url)?;
+    match state.as_str() {
+        "MERGED" => {
+            if let Some(sha) = oid {
+                return Ok(sha);
+            }
+        }
+        "CLOSED" => bail!("PR {pr_url} is CLOSED — not merging"),
+        _ => {
+            crate::ui::step("merging PR (--admin --rebase)...");
+            let out = shell.run(&["gh", "pr", "merge", pr_url, "--admin", "--rebase"])?;
+            if out.status != 0 {
+                let (state2, oid2) = pr_view(shell, pr_url)?;
+                if state2 != "MERGED" {
+                    bail!(
+                        "gh pr merge --admin failed (are you a repo admin?):\n{}{}",
+                        out.stdout.trim(),
+                        out.stderr.trim()
+                    );
+                }
+                if let Some(sha) = oid2 {
+                    spawn_branch_delete(shell.cwd(), remote, branch);
+                    return Ok(sha);
+                }
+                crate::ui::warn("gh pr merge reported an error but the PR is MERGED.");
+            }
+        }
     }
+    // gh pr merge waits for the server-side merge to complete. Read the merged SHA
+    // over the git protocol (fetch) instead of polling the REST API: fewer GitHub
+    // API calls, no sleeps, immune to API rate-limits.
+    run_checked(shell, &["git", "fetch", remote, default])?;
+    let sha = run_checked(shell, &["git", "rev-parse", &format!("{remote}/{default}")])?
+        .stdout
+        .trim()
+        .to_string();
+    if sha.is_empty() {
+        bail!("could not read {remote}/{default} after merge");
+    }
+    spawn_branch_delete(shell.cwd(), remote, branch);
+    Ok(sha)
 }
 
 fn ensure_on_branch(shell: &dyn Shell, m: &Manifest, remote: &str, default: &str) -> Result<()> {
     let branch = &m.delivery.branch;
-    run_checked(shell, &["git", "fetch", remote, "--prune"])?;
+    // No second fetch here: prepare_with already fetched.
     let current = run_checked(shell, &["git", "rev-parse", "--abbrev-ref", "HEAD"])?
         .stdout
         .trim()
@@ -281,7 +467,7 @@ fn ensure_on_branch(shell: &dyn Shell, m: &Manifest, remote: &str, default: &str
     if let Err(e) = switch_res {
         if e.to_string().contains("index.lock") {
             crate::ui::warn("git index is locked, retrying switch...");
-            std::thread::sleep(std::time::Duration::from_millis(1000));
+            std::thread::sleep(Duration::from_millis(250));
             run_checked(
                 shell,
                 &[
@@ -309,71 +495,78 @@ fn ensure_on_branch(shell: &dyn Shell, m: &Manifest, remote: &str, default: &str
     Ok(())
 }
 
+fn committed_subjects(shell: &dyn Shell, base: &str) -> HashSet<String> {
+    let out = shell.run(&["git", "log", "--format=%s", &format!("{base}..HEAD")]);
+    match out {
+        Ok(o) if o.status == 0 => o.stdout.lines().map(|l| l.trim().to_string()).collect(),
+        _ => HashSet::new(),
+    }
+}
+
+/// P0: N+1 spawns instead of 4N, ONE status scan instead of N.
+/// `git add -A` once, then per-group pathspec commits (worktree content of the
+/// named paths; other groups stay staged). Resume detection via one log read.
 fn ensure_committed(shell: &dyn Shell, m: &Manifest, remote: &str, default: &str) -> Result<()> {
+    let _p = trace::phase("cli.ensure_committed");
     let base = format!("{remote}/{default}");
-    let total = m.commit.len();
-    for (idx, g) in m.commit.iter().enumerate() {
-        if g.files.is_empty() {
-            continue;
-        }
-        if already_committed(shell, &g.message, &base)? {
-            continue;
-        }
+    let subjects = committed_subjects(shell, &base);
+    let total = m.commit.iter().filter(|g| !g.files.is_empty()).count();
+    let pending: Vec<&crate::manifest::CommitGroup> = m
+        .commit
+        .iter()
+        .filter(|g| {
+            !g.files.is_empty() && !subjects.contains(g.message.lines().next().unwrap_or("").trim())
+        })
+        .collect();
+    if pending.is_empty() {
+        return Ok(());
+    }
+    run_checked(shell, &["git", "add", "-A"])?;
+    let mut made = 0usize;
+    for g in pending {
         let paths: Vec<String> = g
             .files
             .iter()
             .map(|f| f.to_string_lossy().into_owned())
             .collect();
-        let mut add: Vec<&str> = vec!["git", "add", "-A", "--"];
+        let mut argv: Vec<&str> = vec!["git", "commit", "--no-verify", "-m", &g.message, "--"];
         for p in &paths {
-            add.push(p);
+            argv.push(p);
         }
-        run_checked(shell, &add)?;
-
-        // git status --porcelain is the absolute truth. If it's empty, skip.
-        let status_out = shell.run(&["git", "status", "--porcelain"])?;
-        if status_out.stdout.trim().is_empty() {
-            crate::ui::warn(&format!(
-                "git status is clean, skipping commit for '{}'",
-                g.message
-            ));
-            continue;
+        let out = shell.run(&argv)?;
+        if out.status != 0 {
+            let combined = format!("{}{}", out.stdout, out.stderr);
+            if combined.contains("nothing to commit") || combined.contains("no changes") {
+                crate::ui::warn(&format!("nothing to commit for '{}', skipping", g.message));
+                continue;
+            }
+            bail!(
+                "git commit failed for '{}':\n{}{}",
+                g.message,
+                out.stdout.trim(),
+                out.stderr.trim()
+            );
         }
-
-        let commit_res = shell.run(&["git", "commit", "--no-verify", "-m", &g.message]);
-        if let Ok(out) = &commit_res
-            && out.status != 0
-        {
-            crate::ui::warn(&format!("git commit failed for '{}'", g.message));
-            crate::ui::info(&format!("stdout: {}", out.stdout.trim()));
-            crate::ui::info(&format!("stderr: {}", out.stderr.trim()));
-        }
-        commit_res?;
-        crate::ui::commit_step(idx + 1, total, &g.message);
+        made += 1;
+        crate::ui::commit_step(made, total, &g.message);
     }
     Ok(())
 }
 
-fn already_committed(shell: &dyn Shell, message: &str, base: &str) -> Result<bool> {
-    let subject = message.lines().next().unwrap_or("");
-    let out = shell.run(&["git", "log", "--format=%s", &format!("{base}..HEAD")])?;
-    if out.status != 0 {
-        return Ok(false);
-    }
-    Ok(out.stdout.lines().any(|l| l.trim() == subject.trim()))
-}
-
-fn ensure_pushed(shell: &dyn Shell, branch: &str) -> Result<()> {
+fn ensure_pushed(shell: &dyn Shell, remote: &str, branch: &str) -> Result<()> {
+    let _p = trace::phase("push");
     crate::ui::step("pushing branch...");
     run_checked(
         shell,
-        &["git", "push", "--force-with-lease", "origin", branch],
+        &["git", "push", "--force-with-lease", remote, branch],
     )?;
     Ok(())
 }
 
 fn ensure_pr(shell: &dyn Shell, m: &Manifest, default: &str) -> Result<String> {
+    let _p = trace::phase("pr");
     let branch = &m.delivery.branch;
+    // ONE list call for all states (was two: open + closed).
     let listed = run_checked(
         shell,
         &[
@@ -383,41 +576,45 @@ fn ensure_pr(shell: &dyn Shell, m: &Manifest, default: &str) -> Result<String> {
             "--head",
             branch,
             "--state",
-            "open",
+            "all",
+            "--limit",
+            "5",
             "--json",
-            "url",
-            "--jq",
-            ".[0].url // empty",
+            "url,state",
         ],
-    )?
-    .stdout
-    .trim()
-    .to_string();
-    if !listed.is_empty() {
-        crate::ui::pr_reused(&listed);
-        return Ok(listed);
+    )?;
+    let arr: serde_json::Value = serde_json::from_str(listed.stdout.trim())
+        .map_err(|e| anyhow!("cannot parse gh pr list output: {e}"))?;
+    if let Some(items) = arr.as_array() {
+        for pr in items {
+            let state = pr["state"].as_str().unwrap_or("");
+            let url = pr["url"].as_str().unwrap_or("");
+            if state == "OPEN" && !url.is_empty() {
+                crate::ui::pr_reused(url);
+                return Ok(url.to_string());
+            }
+            if !url.is_empty() {
+                bail!("PR {url} exists for {branch} but is {state} — delete the branch and retry");
+            }
+        }
     }
-    let closed = run_checked(
-        shell,
-        &[
-            "gh",
-            "pr",
-            "list",
-            "--head",
-            branch,
-            "--state",
-            "closed",
-            "--json",
-            "url",
-            "--jq",
-            ".[0].url // empty",
-        ],
-    )?
-    .stdout
-    .trim()
-    .to_string();
-    if !closed.is_empty() {
-        bail!("PR {closed} exists for {branch} but is closed — delete the branch and retry");
+    // Try GraphQL (persistent connection, no gh spawn); fall back to gh CLI.
+    let body = std::fs::read_to_string(shell.cwd().join(&m.delivery.pr_body)).unwrap_or_default();
+    match crate::github::Gh::new(shell) {
+        Ok(gh) => match gh.create_pr(branch, default, &m.delivery.pr_title, &body) {
+            Ok(url) => {
+                crate::ui::pr_opened(&url);
+                return Ok(url);
+            }
+            Err(e) => {
+                crate::ui::warn(&format!(
+                    "GraphQL PR create failed ({e:#}) — falling back to gh"
+                ));
+            }
+        },
+        Err(e) => {
+            crate::ui::warn(&format!("GraphQL unavailable ({e:#}) — using gh"));
+        }
     }
     let url = run_checked(
         shell,
@@ -446,7 +643,8 @@ fn ensure_pr(shell: &dyn Shell, m: &Manifest, default: &str) -> Result<String> {
 }
 
 fn ensure_synced(shell: &dyn Shell, default: &str, remote: &str, merged: &str) -> Result<()> {
-    run_checked(shell, &["git", "fetch", remote, "--prune"])?;
+    let _p = trace::phase("sync");
+    run_checked(shell, &["git", "fetch", "--no-tags", remote, default])?;
     guards::local_default_not_ahead(shell, remote, default)?;
     let stashed = guards::is_dirty(shell)?;
     if stashed {
@@ -468,16 +666,14 @@ fn ensure_synced(shell: &dyn Shell, default: &str, remote: &str, merged: &str) -
     if stashed {
         run_checked(shell, &["git", "stash", "pop"])?;
     }
-    let head = run_checked(shell, &["git", "rev-parse", "HEAD"])?
-        .stdout
-        .trim()
-        .to_string();
+    let head = head_sha(shell)?;
     if head != merged {
         bail!("after sync, HEAD is {head} but the merged SHA was {merged} — origin moved mid-run");
     }
     Ok(())
 }
 
+/// Public validate (used by `ship validate`): artifacts guard + tree check.
 pub fn validate(
     m_orig: &Manifest,
     shell: &dyn Shell,
@@ -488,36 +684,39 @@ pub fn validate(
         &PathBuf::from("ship.toml"),
         &PathBuf::from(&m_orig.delivery.pr_body),
     )?;
+    validate_inner(m_orig, shell, base)
+}
 
-    let dirty_now = if guards::is_dirty(shell)? {
-        guards::dirty_paths(shell)?
-    } else {
-        let all_committed = m_orig.commit.iter().all(|g| {
-            let subject = g.message.lines().next().unwrap_or("");
-            already_committed(shell, subject, base).unwrap_or(false)
-        });
+/// Single status scan (was is_dirty + dirty_paths back-to-back).
+fn validate_inner(
+    m_orig: &Manifest,
+    shell: &dyn Shell,
+    base: &str,
+) -> Result<(Manifest, Vec<PathBuf>, bool)> {
+    let dirty_now = guards::dirty_paths(shell)?;
+    let resume_mode = dirty_now.is_empty();
+    if resume_mode {
+        let subjects = committed_subjects(shell, base);
+        let all_committed = m_orig
+            .commit
+            .iter()
+            .all(|g| subjects.contains(g.message.lines().next().unwrap_or("").trim()));
         if !all_committed {
             bail!(
                 "working tree is clean and not all [[commit]] groups are on the branch — \
                  extract the zip into the repo, or check ship.toml"
             );
         }
-        Vec::new()
-    };
-    let resume_mode = dirty_now.is_empty();
+    }
 
     let (expanded, drops) = m_orig.expand_globs(&dirty_now)?;
     if !resume_mode {
         report_drops(m_orig, &expanded, &drops);
-    }
-
-    if !resume_mode {
         let mut manifest_paths = Vec::new();
         for g in &expanded.commit {
             manifest_paths.extend(g.files.iter().cloned());
         }
         guards::union_check(&dirty_now, &manifest_paths)?;
     }
-
     Ok((expanded, dirty_now, resume_mode))
 }
