@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, bail};
 use std::path::PathBuf;
 use std::process::Command;
+use std::time::Instant;
 
 #[derive(Clone)]
 pub struct Output {
@@ -33,11 +34,18 @@ impl Shell for RealShell {
         if argv.is_empty() {
             bail!("empty argv");
         }
+        crate::trace::count_spawn();
+        let start = Instant::now();
         let out = Command::new(argv[0])
             .args(&argv[1..])
             .current_dir(&self.cwd)
             .output()
             .with_context(|| format!("executing {:?}", argv))?;
+        crate::trace::event(
+            "cmd",
+            &argv.join(" "),
+            start.elapsed().as_secs_f64() * 1000.0,
+        );
         Ok(Output {
             status: out.status.code().unwrap_or(-1),
             stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
