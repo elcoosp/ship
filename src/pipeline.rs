@@ -185,8 +185,8 @@ pub fn prepare_with(
     // Cela élimine le push initial de la branche (~2.3s) et réduit les handshakes TLS.
     // Une fois main mis à jour, on crée le PR, que GitHub marque instantanément comme "Merged".
     let tip = head_sha(shell)?;
-    let refspec_branch = format!("{}:{}", tip, m.delivery.branch);
-    let refspec_main = format!("{}:{}", tip, default);
+    let refspec_branch = format!("{}:refs/heads/{}", tip, m.delivery.branch);
+    let refspec_main = format!("{}:refs/heads/{}", tip, default);
 
     let pr_url: Option<String>;
 
@@ -205,57 +205,61 @@ pub fn prepare_with(
             )?
         }
         MergeMode::Direct | MergeMode::Auto => {
-            let _p = trace::phase("push_atomic");
-            crate::ui::step("single push (branch + main)...");
-            // Get the exact SHA of origin/main to protect it from concurrent pushes
+            // PR-as-Receipt Pattern:
+            // 1. Push branch first (so it's ahead of main)
+            // 2. Create PR (GitHub accepts it because branch > main)
+            // 3. Push main (fast-forward). GitHub sees PR head is reachable from main and auto-merges it.
+
+            let _p_push1 = trace::phase("push_branch");
+            crate::ui::step("pushing delivery branch...");
+            let out_branch = shell.run(&[
+                "git",
+                "push",
+                "--no-verify",
+                "--force-with-lease",
+                remote,
+                &refspec_branch,
+            ])?;
+            if out_branch.status != 0 {
+                bail!("failed to push delivery branch:\n{}", out_branch.stderr);
+            }
+
+            let _p_pr = trace::phase("pr");
+            pr_url = Some(ensure_pr(shell, &m, &default)?);
+
+            let _p_push2 = trace::phase("push_main");
+            crate::ui::step("fast-forwarding main (PR will auto-merge)...");
+
+            // Protect main from concurrent pushes
             let expected_main_sha =
                 run_checked(shell, &["git", "rev-parse", &format!("{remote}/{default}")])?
                     .stdout
                     .trim()
                     .to_string();
 
-            let out = shell.run(&[
+            let out_main = shell.run(&[
                 "git",
                 "push",
                 "--no-verify",
-                "--force", // Force the delivery branch (bypasses stale tracking ref issues)
-                &format!("--force-with-lease={}:{}", default, expected_main_sha), // BUT strictly protect main!
+                &format!("--force-with-lease={}:{}", default, expected_main_sha),
                 remote,
-                &refspec_branch,
                 &refspec_main,
             ])?;
-            if out.status == 0 {
-                crate::ui::info(
-                    "single push succeeded: branch and main updated in one network round-trip",
-                );
-                spawn_branch_delete(shell.cwd(), remote, &m.delivery.branch);
 
-                // Créer le PR après coup pour la trace. GitHub le marquera "Merged" car tip est dans main.
-                let _p_pr = trace::phase("pr");
-                pr_url = Some(ensure_pr(shell, &m, &default)?);
-                crate::ui::merged(&tip);
+            if out_main.status == 0 {
+                crate::ui::info("main fast-forwarded successfully; PR auto-merged by GitHub");
+                spawn_branch_delete(shell.cwd(), remote, &m.delivery.branch);
                 tip
             } else {
-                // Fallback si le push de main est rejeté (branch protection)
                 crate::ui::warn(&format!(
-                    "single push to main rejected:
-{}
-{}
-
-                     Hint: This repo likely has branch protection rules on '{default}'.
-                     Options:
-                       1. Disable branch protection on {default} (if you're the owner)
-                       2. Use --merge via-pr flag to skip single push for this delivery
-                       3. Accept the fallback (slower but correct)",
-                    out.stdout.trim(),
-                    out.stderr.trim()
+                    "push to main rejected:\n{}\n{}\n\n                     Hint: This repo may have branch protection rules on '{default}'.\n                     Falling back to standard PR merge...",
+                    out_main.stdout.trim(),
+                    out_main.stderr.trim()
                 ));
                 if opts.merge_mode == MergeMode::Direct {
                     bail!("direct push to {default} rejected and --merge direct was forced");
                 }
                 let _p_fallback = trace::phase("push_fallback");
-                ensure_pushed(shell, remote, &m.delivery.branch)?;
-                pr_url = Some(ensure_pr(shell, &m, &default)?);
                 merge_via_pr(
                     shell,
                     pr_url.as_ref().unwrap(),
