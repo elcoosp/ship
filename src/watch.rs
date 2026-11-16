@@ -1,8 +1,8 @@
 use crate::guards;
 use crate::manifest::Manifest;
-use crate::pipeline;
 use crate::shell::{RealShell, Shell, run_checked};
 use crate::ui;
+use crate::zipmem;
 use anyhow::{Context, Result, bail};
 use notify::{EventKind, RecursiveMode, Watcher as _};
 use std::collections::{HashMap, HashSet};
@@ -23,6 +23,8 @@ pub struct WatchConfig {
     pub clean_locks: bool,
     pub poll_only: bool,
     pub poll_interval: Duration,
+    pub engine_cli: bool,
+    pub merge_mode: crate::pipeline::MergeMode,
 }
 
 impl Default for WatchConfig {
@@ -36,11 +38,13 @@ impl Default for WatchConfig {
             watch_dir,
             repos_root: default_repos_root(),
             log_file: Some(state.join("watcher.log")),
-            settle: Duration::from_secs(2),
+            settle: Duration::from_millis(200),
             allow_repo_manifest: false,
             clean_locks: false,
             poll_only: false,
             poll_interval: Duration::from_secs(2),
+            engine_cli: false,
+            merge_mode: crate::pipeline::MergeMode::Auto,
         }
     }
 }
@@ -247,9 +251,11 @@ fn debounce_loop(
     shipped: Arc<AtomicUsize>,
     failed: Arc<AtomicUsize>,
 ) -> Result<()> {
-    let mut pending: HashMap<PathBuf, Instant> = HashMap::new();
+    // size-stable settle: fire as soon as the zip size is unchanged for cfg.settle
+    // (default 200ms) instead of a fixed 2s debounce after the last event.
+    let mut pending: HashMap<PathBuf, (Instant, u64)> = HashMap::new();
     loop {
-        if let Ok(Ok(event)) = rx.recv_timeout(Duration::from_millis(200)) {
+        if let Ok(Ok(event)) = rx.recv_timeout(Duration::from_millis(100)) {
             let relevant = matches!(event.kind, EventKind::Create(_) | EventKind::Modify(_));
             if !relevant {
                 continue;
@@ -267,15 +273,21 @@ fn debounce_loop(
                 {
                     continue;
                 }
-                pending.insert(p, Instant::now());
+                let size = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
+                pending.insert(p, (Instant::now(), size));
             }
         }
         let now = Instant::now();
-        let settled: Vec<PathBuf> = pending
-            .iter()
-            .filter(|(_, t)| now.duration_since(**t) >= cfg.settle)
-            .map(|(p, _)| p.clone())
-            .collect();
+        let mut settled: Vec<PathBuf> = Vec::new();
+        for (p, (t, size)) in pending.iter_mut() {
+            let cur = std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+            if cur != *size {
+                *t = now;
+                *size = cur;
+            } else if now.duration_since(*t) >= cfg.settle {
+                settled.push(p.clone());
+            }
+        }
         for zip in settled {
             pending.remove(&zip);
             if seen.contains(&zip) {
@@ -351,6 +363,8 @@ fn process_zip(
     let name_clone = name.clone();
     let project_clone = project.clone();
     let repo_clone = repo.clone();
+    let cfg_engine_cli = cfg.engine_cli;
+    let cfg_merge_mode = cfg.merge_mode;
 
     std::thread::spawn(move || {
         crate::ui::start_task(&project_clone);
@@ -380,7 +394,14 @@ fn process_zip(
         };
 
         let started = std::time::Instant::now();
-        match process_zip_inner(&repo_clone, &zip, &name_clone, wrapper.as_deref()) {
+        match process_zip_inner(
+            &repo_clone,
+            &zip,
+            &name_clone,
+            wrapper.as_deref(),
+            cfg_engine_cli,
+            cfg_merge_mode,
+        ) {
             Ok(outcome) => {
                 let pr_url = outcome.pr_url.as_deref();
                 ui::section_ok(&project_clone, pr_url, started.elapsed());
@@ -511,10 +532,108 @@ fn process_zip_inner(
     zip: &Path,
     name: &str,
     wrapper: Option<&str>,
+    engine_cli: bool,
+    merge_mode: crate::pipeline::MergeMode,
 ) -> Result<crate::pipeline::Outcome> {
     let detail = wrapper.map(|w| format!("strip wrapper '{w}/'"));
     ui::section_begin(name, detail.as_deref());
 
+    if !engine_cli {
+        match gix_flow(repo, zip, wrapper, merge_mode) {
+            Ok(outcome) => return Ok(outcome),
+            Err(e) => {
+                let msg = format!("{e:#}");
+                if msg.contains(crate::engine::UNSUPPORTED) {
+                    ui::warn(&format!(
+                        "gix engine unsupported here ({msg}) — falling back to CLI engine"
+                    ));
+                } else {
+                    return Err(e);
+                }
+            }
+        }
+    }
+    process_zip_inner_cli(repo, zip, wrapper, merge_mode)
+}
+
+/// P1+P2 fast path: zip read in memory, gix object engine, one checkout,
+/// direct fast-forward merge with the PR as a receipt.
+fn gix_flow(
+    repo: &Path,
+    zip: &Path,
+    wrapper: Option<&str>,
+    merge_mode: crate::pipeline::MergeMode,
+) -> Result<crate::pipeline::Outcome> {
+    let shell = RealShell::new(repo.to_path_buf());
+    if !guards::is_git_repo_root(&shell, repo)? {
+        bail!("{} is not a git repository root", repo.display());
+    }
+    let default = guards::default_branch(&shell, "origin")?;
+    guards::assert_on_main_and_in_sync(&shell, "origin", &default)?;
+    guards::ensure_no_git_locks(&shell, false)?;
+
+    let stashed = guards::is_dirty(&shell)?;
+    if stashed {
+        run_checked(
+            &shell,
+            &[
+                "git",
+                "stash",
+                "push",
+                "-u",
+                "-m",
+                &format!("ship: wip before {}", zip.display()),
+            ],
+        )?;
+        ui::info("WIP stashed");
+    }
+
+    let result = (|| -> Result<crate::pipeline::Outcome> {
+        let entries = zipmem::read_entries(zip, wrapper)?;
+        let manifest_text = zipmem::find(&entries, "ship.toml")
+            .map(|e| String::from_utf8_lossy(&e.bytes).into_owned())
+            .context("ship.toml is missing from the root of the zip")?;
+        let manifest = Manifest::from_text(&manifest_text)?;
+
+        // Materialize the gitignored artifacts (gh pr create --body-file needs them).
+        let _ = std::fs::write(repo.join("ship.toml"), &manifest_text);
+        if let Some(pb) = zipmem::find(&entries, &manifest.delivery.pr_body) {
+            let dest = repo.join(&manifest.delivery.pr_body);
+            if let Some(parent) = dest.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::write(&dest, &pb.bytes);
+        }
+
+        let opts = crate::pipeline::PrepareOpts {
+            merge_mode,
+            default: Some(default.clone()),
+            engine: Some(crate::pipeline::EngineInput {
+                repo_path: repo.to_path_buf(),
+                entries,
+                base_commit: manifest.delivery.base_commit.clone(),
+            }),
+        };
+        crate::pipeline::prepare_with(false, false, false, &manifest, &shell, opts)
+    })();
+
+    if stashed {
+        if run_checked(&shell, &["git", "stash", "pop"]).is_ok() {
+            ui::info("WIP restored");
+        } else {
+            ui::warn("WIP conflict — stash preserved; resolve in tree, then: git stash drop");
+        }
+    }
+    result
+}
+
+/// Legacy CLI path (kept verbatim as the safety net / --engine cli).
+fn process_zip_inner_cli(
+    repo: &Path,
+    zip: &Path,
+    wrapper: Option<&str>,
+    merge_mode: crate::pipeline::MergeMode,
+) -> Result<crate::pipeline::Outcome> {
     let shell = RealShell::new(repo.to_path_buf());
     if !guards::is_git_repo_root(&shell, repo)? {
         bail!("{} is not a git repository root", repo.display());
@@ -660,8 +779,13 @@ fn process_zip_inner(
             ));
         }
 
-        // 4. Prepare
-        let outcome = pipeline::prepare(false, false, false, &manifest, &shell)?;
+        // 4. Prepare (fast CLI commits + new merge strategy)
+        let opts = crate::pipeline::PrepareOpts {
+            merge_mode,
+            default: Some(default.clone()),
+            engine: None,
+        };
+        let outcome = crate::pipeline::prepare_with(false, false, false, &manifest, &shell, opts)?;
 
         if stashed {
             if run_checked(&shell, &["git", "stash", "pop"]).is_ok() {
@@ -756,21 +880,8 @@ fn detect_wrapper_prefix(zip: &Path) -> Result<Option<String>> {
 }
 
 fn zip_entries(zip: &Path) -> Result<Vec<String>> {
-    let out = std::process::Command::new("unzip")
-        .args(["-Z1", &zip.to_string_lossy()])
-        .output()
-        .context("running unzip -Z1")?;
-    if !out.status.success() {
-        bail!(
-            "unzip -Z1 failed (corrupt or not a zip?): {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    Ok(String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty() && !s.ends_with('/'))
-        .collect())
+    // In-memory central-directory read; no `unzip -Z1` spawn.
+    zipmem::list_names(zip)
 }
 
 fn resolve_project(repos_root: &Path, stem: &str) -> Result<Option<(String, String)>> {
@@ -840,11 +951,14 @@ fn notify(title: &str, body: &str, pr_url: Option<&str>, is_error: bool) {
     #[cfg(target_os = "macos")]
     {
         // Check if terminal-notifier is installed for clickable notifications
-        let has_tn = std::process::Command::new("which")
-            .arg("terminal-notifier")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
+        static HAS_TN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let has_tn = *HAS_TN.get_or_init(|| {
+            std::process::Command::new("which")
+                .arg("terminal-notifier")
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        });
 
         if has_tn {
             let mut cmd = std::process::Command::new("terminal-notifier");
