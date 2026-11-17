@@ -271,9 +271,27 @@ pub fn prepare_with(
         }
     };
 
-    if opts.merge_mode == MergeMode::ViaPr || merged != head_sha(shell)? {
+    // ─── POST-DELIVERY LOCAL CLEANUP (ZERO NETWORK) ───────────────
+    // Instead of `ensure_synced` (which fetches), we locally reset `default`
+    // to the known `merged` SHA. This is instantaneous and avoids network.
+    let current_branch = run_checked(shell, &["git", "rev-parse", "--abbrev-ref", "HEAD"])?
+        .stdout
+        .trim()
+        .to_string();
+
+    if current_branch == m.delivery.branch {
+        crate::ui::step("cleaning up local workspace (zero network)...");
+        // 1. Force-reset local `default` (e.g., main) to the merged SHA and check it out
+        run_checked(shell, &["git", "checkout", "-B", &default, &merged])?;
+        // 2. Delete the local delivery branch (ignore error if already gone)
+        let _ = shell.run(&["git", "branch", "-D", &m.delivery.branch]);
+        crate::ui::info("workspace cleaned: local main updated and delivery branch deleted");
+    } else if current_branch != default {
+        // Fallback: if we are on some other unexpected branch, sync it normally
         ensure_synced(shell, &default, remote, &merged)?;
     }
+    // ──────────────────────────────────────────────────────────────
+
     guards::verify_author(shell)?;
 
     trace::event("total", "prepare", total.elapsed().as_secs_f64() * 1000.0);
